@@ -22,6 +22,18 @@
         "pages": [
           "scripting"
         ]
+      },
+      {
+        "group": "Guides",
+        "pages": [
+          "prefabs",
+          "materials",
+          "animation",
+          "ai",
+          "ui",
+          "rendering",
+          "packaging"
+        ]
       }
     ],
     "global": {

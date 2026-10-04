@@ -1,0 +1,147 @@
+---
+title: "Packaging and asset packs"
+sidebarTitle: "Packaging"
+description: "Package a game as a standalone folder with WizmPlayer and a single Game.wak asset pack, and build the editor as a Microsoft Store package."
+icon: "box-archive"
+---
+
+A packaged game is a folder holding `WizmPlayer.exe`, its DLLs, the engine's
+`shaders/` folder, a `game.cfg`, and the project's content as one file:
+`Game.wak`. The player mounts that pack at startup and reads everything -
+meshes, textures, materials, levels, prefabs, scripts, sounds, fonts - out of
+it, straight into memory. Neither the project's `Game` folder nor its
+`asset_database.db` ships.
+
+## Packaging from the editor
+
+**File > Package Game** opens the dialog: choose an output folder, the player
+build to bundle (Debug or Release, built in Visual Studio first) and the
+startup level, and press **Package**. **Pack assets into a single Game.wak** is on
+by default; untick it to copy the `Game` folder next to the player instead
+(the pre-pack layout, which the player still understands).
+
+<Tip>
+
+Ship Release packages. A Debug package carries the debug DLLs
+(`assimp-vc143-mtd.dll`, `fmodL.dll`, debug PhysX), and the Assimp one needs
+Visual Studio's debug C++ runtime, which only exists on machines with Visual
+Studio installed. A Release package carries `assimp-vc143-mt.dll`, `fmod.dll`
+and the release PhysX DLLs, which are built against the static runtime;
+`glfw3.dll` still needs the Visual C++ 2015-2022 Redistributable.
+
+</Tip>
+
+The same thing without a window, for a build script (run from the
+`WizmEditor` folder, since the player, DLL and shader paths are relative to
+it):
+
+```text
+WizmEditor.exe --package <project folder> <output folder> [--config Debug|Release] [--level <.wmap>] [--loose]
+```
+
+`--level` defaults to the project's startup map; `--loose` copies the `Game`
+folder instead of packing. The exit code is 0 on success.
+
+## The editor as a Microsoft Store package
+
+`WizardMachine.Package` (a Windows Application Packaging project in the
+solution) builds the editor into an MSIX package for the Store. In Visual
+Studio: right-click it > **Package and Publish > Create App Packages**, choose
+the Store (or sideloading), Release, x64. Building the solution in Release
+also writes the packages to `WizardMachine.Package/AppPackages`, because
+the project's user settings package on every build.
+
+The package keeps the source tree's layout, since the editor finds the
+engine relative to its own folder:
+
+| In the package | From | Used by |
+| --- | --- | --- |
+| `WizmEditor/WizmEditor.exe` | the WizmEditor project | entry point |
+| `WizmEditor/*.dll` | `vendor/...` (premake's `Dll`/`DllDebug`/`DllRelease` lists) | the editor, and copied into packaged games |
+| `WizmEditor/resources/` | `WizmEditor/resources` | viewport billboard icons, the default theme (`Default.wtheme`) and dock layout (`DefaultLayout.ini`) |
+| `WizmPlayer/WizmPlayer.exe` | the WizmPlayer project | Package Game |
+| `engine/WizmRender/shaders/` | the same folder | the editor, and copied into packaged games |
+| `vendor/imgui/imgui/misc/fonts/*.ttf` | the same folder | Editor Appearance's font list |
+
+The project's `Content` items list these files. A new file the editor loads
+through a `../` path, or a new runtime DLL, needs an entry there as well as
+in premake5.lua.
+
+An installed editor differs from one run from a source checkout in three
+ways (`platform_shell.h`):
+
+- It starts wherever Windows launches it (System32 from the Start menu), so
+  it first moves its working directory to `<install>/WizmEditor`.
+- Its install folder is read-only, so `imgui.ini`, `editor_style.ini` and
+  `last_project.txt` live in `%LOCALAPPDATA%/WizardMachine`. Windows keeps a
+  packaged app's writes there in the app's own storage, which it removes
+  when the app is uninstalled. Until the first two exist, the editor starts
+  with `resources/Default.wtheme` and `resources/DefaultLayout.ini` (so does
+  a fresh checkout). To change what new users get, export a theme over
+  `Default.wtheme` from **Editor Appearance**, or copy the docked windows and
+  `[Docking][Data]` from your `imgui.ini` into `DefaultLayout.ini`.
+- **Package Game** bundles the player in `<install>/WizmPlayer` and the DLLs
+  beside the editor. Both are Release builds, so the dialog switches to
+  Release.
+
+The package depends on the `Microsoft.VCLibs.140.00.UWPDesktop` framework,
+which Visual Studio adds and the Store installs with it. It provides the
+C++ runtime `glfw3.dll` needs. Raise the version in `Package.appxmanifest`
+(**Packaging** tab) before each Store submission.
+
+## What goes into the pack
+
+`packager_system::package_assets` walks the project's `Game` folder and packs
+every file in it, except the asset database, the editor's `Intermediate`
+folder (preview thumbnails) and other `.wak` files. A file that is registered
+in the asset database carries its row - id, type, the mesh's material slot
+defaults, legacy extra animation sources - so the player can build the same
+asset objects the editor builds from the database. Files that are not assets
+(levels, the `.fbx` an animation clip was cut from, a font's atlas PNG)
+travel as plain files and are found by path.
+
+Paths inside the pack are relative to the `Game` folder with forward slashes
+(`Meshes/cube.fbx`). A lookup takes any spelling a path can have in the
+engine - `Game/Levels/e1.wmap`, the absolute path the project had when it was
+packed, or the packed relative path - and ignores letter case: leading
+folders are peeled off the query until what remains names a packed file.
+
+## Format
+
+`.wak` is a plain binary container (`asset_pack.h`):
+
+| Section | Content |
+| --- | --- |
+| header | `"WPAK"`, version (`uint32`), table offset (`uint64`), entry count (`uint64`) |
+| data | every file's bytes, back to back |
+| table | one record per file: id, type (`0xFF` for a plain file), path, file name, material slots, extra animation sources, data offset, data size |
+
+Strings are a `uint32` length followed by the bytes. Opening a pack reads
+only the table; a file's bytes are read when something asks for them, so a
+pack can be far larger than memory. The packer writes the files in path order
+so the same project packs to the same bytes, and reads the pack back before
+reporting success.
+
+## How the player loads it
+
+`game.cfg` names the pack (`asset_pack: Game.wak`; the default when the key
+is missing). If the file exists, `asset_manager::load_asset_pack` mounts it
+(`content_files.h`) and constructs every asset from the packed bytes in the
+same dependency order `load_database` uses - textures before materials,
+shaders before materials, meshes before the clips that target their
+skeletons. Without a pack the player falls back to `Game/asset_database.db`
+and loose files exactly as before.
+
+Every asset type has a second constructor taking the file's bytes. The
+constructors share their parsing code with the file constructors, so a pack
+and a database produce the same asset. Where an asset reads a *sibling* file
+by path - an animation clip's source `.fbx`, a font's atlas, a skeletal
+mesh's extra animation sources - it goes through `content_files`, which
+serves the mounted pack first and falls back to disk. The scene reads levels
+and prefabs the same way, and `script_controller` compiles scripts from
+memory, so `load_level("Levels/e2.wmap")` and prefab references resolve
+inside the pack.
+
+Assets built from bytes report a source stamp of 0 (there is no file to
+stamp), and the editor-only paths that rewrite files - shader hot reload,
+Save All, imports - are never reached in the player.

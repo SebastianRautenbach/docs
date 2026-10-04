@@ -1,0 +1,73 @@
+---
+title: "Prefabs"
+description: "Save an entity hierarchy as a .wprefab, place instances of it in levels, tune each instance, and edit the prefab in the prefab editor."
+icon: "cubes"
+---
+
+A prefab is a `.wprefab` file holding **one root entity** and everything under it: its components and its child entities. Levels don't copy that content - they place *instances* of it, and every instance follows the file.
+
+## Instances
+
+An entity that references a prefab is an **instance root**. A level stores its name, its position and rotation, its scale (with the prefab root scale it was placed against) and the reference - plus, if they were edited on the instance, its tags and its scripts' field values. Whenever a level is loaded (in the editor, in WizmPlayer, or when play mode ends), the instance's components and children are rebuilt from the prefab file. Change the file and every instance in every level changes with it.
+
+**Script fields are what an instance is tuned with.** A Scripting component's inspector fields (see [Scripting](/scripting#behaviour-classes-and-inspector-fields)) can be set on an instance even though the rest of the component belongs to the prefab: that is how one `Door` instance is set to `key_color = "red"` and the next to `"blue"` while both stay instances of the same prefab. Only the fields you change are stored, a changed component shows **Reset to Prefab**, and the values survive level reloads, play mode and edits to the prefab itself.
+
+**Tags may also be overridden**, and name what an instance *is* rather than how it is tuned. An instance whose tags were never edited keeps following the prefab's; an edited one shows a **Reset** button that puts the prefab's tags back.
+
+**Scale follows the prefab; placement doesn't.** An instance's position and rotation are always its own. Its scale is the prefab root's: change the root's scale in the prefab editor and every instance follows, in every level. Scale an instance in the level (gizmo or Properties) and each axis you changed becomes its own and stays, whatever the prefab does later - a door stretched to its opening keeps its width and height but still takes a new thickness from the prefab. **Reset** beside **Scale** in the Properties panel, or **Reset Scale to Prefab** for a whole selection (Scene panel right-click, or the Properties panel with several entities selected), makes it follow again, and so does setting an axis back to the prefab's value. The root's rotation and position only seed new placements - to turn or move what every instance shows, rotate or move a child inside the prefab.
+
+In the editor, instance roots show in blue in the Scene panel, and the entities inside them in grey:
+
+| | Instance root | Entities inside an instance |
+|---|---|---|
+| Rename | yes | no |
+| Move / rotate / scale | yes (gizmo, Properties) - a scale axis you change stops following the prefab | no |
+| Edit or add/remove components | no (except a Scripting component's field values) | no |
+| Add / remove / reparent children | no | no |
+| Delete | yes (deletes the whole instance) | no |
+| Copy / paste | yes (the copy is another instance) | no |
+
+Clicking anything inside an instance in the viewport selects the instance. The Properties panel shows which prefab an entity came from, with **Open Prefab** to edit it and, on the root, **Unpack Prefab** to break the link - the instance then turns into ordinary entities that no longer follow the file (nested instances inside it keep their own links).
+
+## Making a prefab
+
+- **From an entity**: right-click it in the Scene panel > **Save As Prefab...**. The file lands in the project's `Game/Prefabs` folder and the entity becomes an instance of it.
+- **From scratch**: in the Content Browser, **+ Add > New Prefab**. This writes a prefab with an empty root and opens it in the prefab editor.
+
+Drag a prefab tile from the Content Browser into the Viewport to place an instance. The dropped instance starts with the prefab root's rotation and scale; its position comes from where you dropped it, and its scale keeps following the prefab's until you change it.
+
+## The prefab editor
+
+Double-click a prefab in the Content Browser (or use **Open Prefab** on an instance) to edit it. The level is parked, and the Scene, Properties and Viewport panels show the prefab's own hierarchy instead - the root sits at the origin and is fully editable, marked in orange. A **Prefab Editor** window lists what's open:
+
+- **Save** writes the file.
+- **Save & Close** writes the file and brings the level back. Every instance in the level is rebuilt from the file at that moment, so they show the change straight away - a new root scale included, except on axes an instance has a scale of its own on (the window says how many). Other levels pick it up when they load.
+- **Discard & Close** brings the level back without saving.
+
+<Note>
+
+While a prefab is open, saving/opening levels, switching projects, packaging and play mode are unavailable.
+
+</Note>
+
+A prefab holds exactly one root. New entities created in the prefab editor are parented under the root automatically, and the editor refuses to save while a second top-level entity exists.
+
+### Nested prefabs
+
+Dropping another prefab into the prefab editor places an instance of it under the root. The outer prefab stores only a reference to the inner one, so editing the inner prefab updates it everywhere - including inside the outer prefab. A nested instance follows the inner prefab's root scale the same way, unless the outer prefab scaled it. A prefab can't contain an instance of itself; the editor refuses the drop, and a cycle that reaches the loader through nested files is reported on the console and left empty.
+
+### Levels saved before scale followed the prefab
+
+They load exactly as they looked. From then on, an instance whose scale matched its prefab root's follows it. The first save of a prefab that changes its root scale records the old scale in the file (a `legacy_baseline` block), so instances in older levels that still had it follow too, even before those levels are saved again. Open and save each older level once: that records which instances follow, and later prefab edits no longer depend on the old scale. An instance whose prefab root scale was changed before this version can't be told apart from one scaled on purpose: it keeps its size and shows **Reset**. Search the Scene panel for it, shift-click the results and use **Reset Scale to Prefab**.
+
+## References and packaging
+
+Instances store the prefab path **relative to the project's `Game` folder** (for example `Prefabs/Player.wprefab`), so levels keep working when the project moves and in packaged builds, where the `Game` folder sits next to `WizmPlayer.exe`. Older levels that saved absolute paths still load: the file is used if it exists at that path, otherwise it's looked up by name under the `Game` folder, and the reference is rewritten in the portable form on the next save.
+
+If a prefab file can't be found at all, the instance loads as an empty entity with its name and transform and keeps its reference and which of its scale axes were its own, so it heals once the file is back. Levels saved before this system stored a full copy of each instance; that copy is used as the fallback in that case.
+
+## Limitations
+
+- An instance can't override anything but its root's name, position, rotation and scale, its tags and the field values of its root's Scripting components. To customise a placement beyond that, unpack it.
+- Entities inside an instance get fresh ids on every load; scripts should find them by name rather than by id.
+- Instance names are independent of the prefab root's name: renaming the root in the prefab editor doesn't rename existing instances.

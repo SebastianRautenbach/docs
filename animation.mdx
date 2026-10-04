@@ -1,0 +1,159 @@
+---
+title: "Animation"
+description: "Animate skeletal meshes with clips, animation graphs, blend spaces and notifies, and drive them from scripts."
+icon: "person-running"
+---
+
+WizardMachine animates skeletal meshes the way Unreal does: a character's **skeletal mesh** owns a skeleton, every **animation clip** is an asset of its own that targets that skeleton, an **animation graph** decides which clip plays from a state machine driven by parameters, and scripts talk to the graph through those parameters and get called back on clip **notifies** and state changes.
+
+## Assets
+
+### Skeletal meshes
+
+A mesh file (`.fbx`, `.gltf`, `.glb`, `.dae`) with skinned geometry or animations imports as a **Skeletal Mesh**. Its skeleton is the set of nodes that carry vertex weights or animation channels, in file order. Everything that animates the mesh - a clip, a graph - is matched to it by **bone name**, so animations for a character must be exported against the same rig (a Mixamo character and Mixamo animations for it, say).
+
+### Animation clips (.wanim)
+
+One clip of one source file, targeting one skeleton - Unreal's Animation Sequence. A `.wanim` is a small text file next to the source it was cut from:
+
+```text
+animation{
+    target_skeleton_id:14951280-efed-4519-8fca-ffcdc466575a;
+    source_file:Walking.fbx;
+    anim_clip_index:0;
+    anim_rate:1;
+    anim_loop_hint:1;
+    anim_notifies:Footstep@0.35|Footstep@0.82;
+}
+```
+
+The keyframes are re-read from the source when the project loads; the `.wanim` holds what you edit: the **rate** (a speed multiplier baked into the clip), the **loop hint** (what a graph state starts with when the clip is assigned) and the **notifies** (named times that fire script events). A clip's name - what graph states and scripts refer to it by - is its file name without the extension: `Walking.wanim` is the clip `"Walking"`.
+
+Clips baked into a skeletal mesh file are also cut into `.wanim` assets when the mesh is imported (`hero.fbx` with animations `idle` and `run` gives `hero_idle.wanim` and `hero_run.wanim`), so every clip can be dropped into a graph. The mesh keeps its embedded clips as well; a name resolves to the embedded clip first, then to the asset.
+
+### Animation graphs (.wanimgraph)
+
+A state machine over clips: states, transitions, and the parameters that drive them. Assigned to a skeletal mesh component, it decides what plays every frame. One graph serves every entity that uses it; each entity keeps its own current state and parameter values.
+
+## Importing animations
+
+Three ways, all ending in `.wanim` assets next to the source file:
+
+- **Drop the file into the Game folder.** The content browser's rescan classifies a mesh file by content. A file with animations and no geometry (a Mixamo "without skin" download) is an animation file: it is matched to the skeletal mesh whose bones it shares the most names with and cut into clips for it. If no skeleton in the project shares any bone names, the log says so and the file is left alone - import the character first.
+- **Content Browser > + Add > Import Animation...** Pick the target skeleton (or leave **Auto-detect**), then the file. The file is copied into the open folder and every animation in it becomes a clip.
+- **Right-click a Skeletal Mesh tile > Import Animation...** The same, with the skeleton already chosen; the file lands next to the mesh.
+
+A file that holds several animations gives one clip per animation, named `<file>_<animation>`. Re-importing a file skips the clips already cut from it.
+
+## The Animation Graph editor
+
+**Content Browser > + Add > New Animation Graph**, or double-click a `.wanimgraph` tile, or **Open Graph** on a skeletal mesh component. The window has the parameter list on the left, the graph canvas in the middle and a details panel on the right; the menu bar holds **Save**, the **Skeleton** the graph is for (which decides which clips the pickers list) and the **Entry State**.
+
+On the canvas: right-click empty space to add a state, drag nodes to arrange them, right-click a node to add a transition from it (then click the target), set it as the entry state or delete it. Click a transition's arrow to select it. Middle-drag or Alt-drag pans, the wheel zooms, Delete removes the selection, Escape cancels a pending transition. **Save All** (Ctrl+Shift+S) writes every graph with unsaved changes (a `*` after its name in the window title), along with the other changed assets.
+
+The **Any State** node is a source only: a transition from it fires from whichever state is playing (a death, a hit reaction), never back into the state that is already playing.
+
+### States
+
+A state plays one clip, looping or not, at a speed multiplier - or, as a [blend space](#blend-spaces), blends several by a parameter. The entry state (green) is where playback starts. The details panel lists the transitions leaving the state.
+
+### Transitions
+
+A transition fires when its **conditions** all hold (AND) - and, with **Has Exit Time** on, only once the state's clip has reached the given fraction of its length (each loop for a looping state, once for a one-shot). It cross-fades over **Blend** seconds; 0 switches instantly. Transitions are tried in the order they were made and the first that fires wins. No new transition is considered while one is under way.
+
+A condition compares a parameter with a constant: `==`, `!=`, `<`, `>`, `<=`, `>=` for numbers, `is true` / `is false` for bools. A trigger's condition holds while the trigger is set, and firing the transition consumes it.
+
+A transition with neither an exit time nor conditions fires the moment the state is entered - the editor flags it, since that is rarely what you want (but it is how a one-shot state returns to idle: exit time 1, no conditions).
+
+### Parameters
+
+The graph's variables, of four kinds: **Float**, **Int**, **Bool** and **Trigger** (set by a script, consumed by the first transition it fires). Each has a default the graph starts from. Scripts set them by name; the Properties panel shows them live on a skeletal mesh component and lets you poke them without a script.
+
+### Blend spaces
+
+Tick **Blend Space (1D)** on a state to blend clips by a number parameter instead of playing one clip: at each threshold its clip plays alone, in between two neighbours cross-fade - `Walk` at 1 and `Run` at 4 driven by `Speed`. The clips share one normalized clock, so a walk and a run of different lengths stay in step.
+
+## The Animation editor (clips)
+
+Double-click a `.wanim` tile. It shows the clip's skeleton, source and length, and edits the **rate**, the **loop hint** and the **notifies**: a name and a time each. When playback crosses a notify, the entity's scripts get `OnAnimationEvent(name)` - see [Scripting](#scripting). Save writes the `.wanim`; Save All writes it too while the window title shows `*`.
+
+## The skeletal mesh component
+
+The **Animation Mode** combo picks between:
+
+- **Single Clip** - the older mode: a **Default Clip** that autoplays, **Loop**, **Speed**, and scripts calling `play_animation` / `blend_to_animation`.
+- **Animation Graph** - a **Graph** slot (a `.wanimgraph` tile can be dropped on it, or on the entity), **Open Graph**, the live state and the parameter values.
+
+**Speed** scales everything the component plays in either mode.
+
+## Scripting
+
+Every call lives on `entity` and needs a `skeletal_mesh` component. See the [Scripting reference](/scripting#animation) for the full table; the shape of it:
+
+```cpp
+class player
+{
+    float move_speed = 0.0f;       // set by the movement code, read by the graph
+    private entity@ mesh;
+    private entity@ footstep_sound;
+
+    void Start()
+    {
+        // The rig: this behaviour on the character, the skeletal mesh on a
+        // child named "Mesh" (find_child is the script's own helper - see
+        // the Scripting reference's first example).
+        @mesh = find_child(self(), "Mesh");
+        @footstep_sound = find_child(self(), "FootstepSound");
+    }
+
+    void Update(float dt)
+    {
+        if (mesh is null) return;
+
+        // Drive the graph: it picks Idle / Walk / Run from these.
+        mesh.set_anim_float("Speed", move_speed);
+        mesh.set_anim_bool("IsGrounded", is_character_grounded());
+        if (is_key_pressed(key::space)) mesh.set_anim_trigger("Jump");
+
+        // A one-shot on top of whatever the graph plays.
+        if (is_mouse_button_pressed(mouse_button::left))
+            mesh.play_animation_override("Attack", false, 0.1f, 0.2f);
+    }
+
+    // A notify placed in a clip, by name.
+    void OnAnimationEvent(string name)
+    {
+        if (name == "Footstep" && footstep_sound !is null) footstep_sound.play_sound();
+        if (name == "Hit") broadcast_message("melee_hit", 25.0f);
+    }
+
+    void OnAnimationStateChanged(string from, string to)
+    {
+        log_info("animation: " + from + " -> " + to);
+    }
+}
+```
+
+Events reach the scripts on the skeletal mesh's own entity; if none of them handles the event, the nearest ancestor with a handler gets it - the usual rig has the behaviour on the character and the mesh on a child named `Mesh`.
+
+The Test project enemies are a worked example of this rig: the FPS guide walks through the graph they share and how the behaviours drive it.
+
+The single-clip calls keep working when a graph is assigned: `play_animation` / `blend_to_animation` then play the clip as an override on top of the graph, and `stop_animation` stops the override. A script written before graphs existed needs no changes.
+
+## How playback works
+
+Each frame, per skeletal mesh component (in parallel across components):
+
+1. The graph advances: the current state's clock moves (normalized 0..1 of the state's length), a transition under way blends towards its target, or the transitions leaving the current state are tried in order.
+2. The result is a list of **pose layers** - clips with times and weights summing to one: one clip, two for a blend space, more during a cross-fade.
+3. The **override** slot, if a clip plays in it, fades in over its blend-in, fades out over its blend-out (a one-shot times its fade to land on zero as it ends), and is blended over the graph's pose.
+4. Every bone is sampled from each layer and blended (positions and scales linearly, rotations by slerp), then only the **rotation** is kept: a bone's translation and scale always come from the mesh's own bind pose, because a clip's baked translation belongs to the rig it was authored on. Bone matrices go to the GPU skinning shader.
+5. Notifies crossed by any playing clip and states entered are queued, and delivered to scripts once every component is done.
+
+## Limitations
+
+- **No root motion.** A clip never moves the entity; drive movement from gameplay code.
+- **One layer.** No additive or per-bone-mask layers; the override slot is the way to play something on top.
+- **1D blend spaces only.**
+- **No transition interruption.** A cross-fade runs to its end before another transition is considered. A script's `play_anim_state` does interrupt.
+- Retargeting is by bone name only.

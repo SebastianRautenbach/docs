@@ -1,0 +1,105 @@
+---
+title: "Rendering pipeline"
+sidebarTitle: "Rendering"
+description: "How WizardMachine draws a frame: simulation order, the render passes, the editor view modes, and the optimisations behind the forward clustered renderer."
+icon: "display"
+---
+
+How a frame is drawn, and the optimisations in place. Everything lives in `engine/WizmRender` (renderers, passes, GL objects) and `engine/WizmECS/src/system/*_system.cpp` (the ECS side that feeds the render queue). Both `WizmPlayer/src/main.cpp` and `WizmEditor/src/main.cpp` assemble the same pass list; the editor adds the wireframe overlay of its view modes, billboards, collider gizmos, the selection outline and picking.
+
+## Frame order
+
+Simulation (in this order, every frame):
+
+1. `update_gui` — UI input for the frame: hit-testing, hover/press/release, button callbacks. Runs **before** scripts so they see what the UI consumed.
+2. `update_scripts` — AngelScript `on_update` with the filtered input view.
+3. `update_physics`
+4. `refresh_transforms` — rebuilds every entity's cached local matrix that changed. After this point nothing moves entities, so the parallel systems below only read.
+5. `update_cameras`, `update_animations` (parallel), `update_particle_systems` (parallel), `update_audio`
+6. `apply_cursor_state` — pushes the effective cursor lock to the window, only on change.
+
+Submission: `queue.clear()` (also advances the shared instance ring buffer), `submit_lights`, `submit_scene`, `submit_particles`, `queue.sort()`, `submit_gui`.
+
+Render passes, in pipeline order:
+
+| Pass | What it does |
+|---|---|
+| `cluster_build_pass` | Builds the clustered-lighting grid. Cached: only re-dispatched when the projection, near/far or viewport size change. |
+| `light_cull_pass` | CPU-culls lights against the view frustum first (directional lights always kept), then assigns the survivors to clusters on the GPU. Skipped when there were no lights last frame either. |
+| `shadow_pass` | 3 cascaded shadow maps for the directional light (practical split, lambda 0.8, out to 300 units; each cascade fits a texel-snapped bounding sphere of its view slice, with the ortho near plane pushed 300 units back towards the light so casters outside the slice still throw shadows into it). Static meshes are drawn as instance batches. |
+| `point_shadow_pass` | Cube shadow maps for up to 4 point lights, geometry-shader routed. Skipped entirely when no visible point light casts shadows. Instanced for static meshes. |
+| `environment_pass` | Turns the active skybox into the scene's reflection source, as Unity's environment reflections / Unreal's sky light do. When the sky changes (texture id + `texture_hdr::m_generation`), compute shaders convert the equirectangular panorama to a cubemap (128-512 px faces; each texel clipped at display white and decoded with `pow(c, 2.2)`, because the skybox pass shows the raw texel with no tonemapping - so a mirror shows the sky exactly as it is displayed and a rough surface the blurred visible sky, not an HDR sun's full energy) and prefilter it with the GGX lobe into 6 mips: mip 0 is the mirror copy, standing for the shader's roughness floor 0.045, and mip *i* the convolution for roughness `0.045 + 0.955 * i/5` (filtered importance sampling, 128 samples). A 256x256 split-sum BRDF table is built once at start-up. Costs nothing on frames where the sky is unchanged. |
+| `depth_prepass_pass` | Depth pass over everything in view, back-faces culled. Also writes each pixel's view-space normal into the `scene_gbuffer` (the "thin G-buffer": the normal target shares the scene target's depth texture). |
+| `ssao_pass` | Screen-space ambient occlusion from depth + pre-pass normals (16-sample hemisphere kernel, 4x4 noise, 4x4 blur). The forward shader multiplies its ambient term by the result and its direct light by a configurable share. Off unless the level's post-process component enables it. |
+| `clustered_forward_pass` | The PBR shading pass. With the pre-pass on it runs with `GL_LEQUAL` and depth writes off, so each pixel is shaded exactly once. Static meshes drawn as instance batches; skinned meshes one draw each. With a skybox, every surface also reflects the sky: the prefiltered cubemap along the reflection vector (mip from roughness), times the split-sum weight `F0 * A + B`, specular occlusion from the material and screen-space AO, and a horizon fade for normal-mapped reflections pointing into the surface; the flat ambient term is then scaled towards `(1 - F0 * A - B) * (1 - metallic)` as the intensity goes from 0 to 1 (metals get no flat ambient once a sky is fully on). Strength = the skybox component's **Reflection Intensity** (default 1, so levels that already had a skybox show reflections). Draws into the gbuffer's forward target: scene colour, a second attachment with roughness (r) and that specular weight with fog folded in (gba, RGBA8), and a third with the sky reflection radiance the pixel received (RGBA16F, the scene target's precision, since SSR subtracts it) - both for SSR. Uploads `debugMode` (`render_pass_context::shader_debug_mode`) to every forward program each frame, and skips its draw in the editor's Wireframe view mode (see [Editor view modes](#editor-view-modes)). |
+| `skybox_pass` | Sky behind everything. Skipped when `render_pass_context::draw_skybox` is off (the editor's diagnostic view modes). |
+| editor only: `wireframe_overlay_pass` | The Wireframe / Lit Wireframe view modes: the triangle edges in `GL_LINE` mode over the pre-pass depth, after the sky. Does nothing in any other mode. |
+| `ssr_pass` | Screen-space reflections: view-space ray march against the depth buffer from every pixel the normal/roughness allow, binary-refined. A hit **replaces** the forward pass's sky reflection with what it hit: `scene + coverage * (weight * hit - sky)` in linear light, where `sky` is the exact radiance the forward pass recorded, `weight` its specular weight and `coverage` the screen-edge, roughness and camera-facing fades times `min(intensity, 1)` (an intensity above 1 brightens the hit instead). A miss keeps the sky reflection, so reflections fall back to the sky the way they fall back to reflection probes elsewhere. The trace writes the corrected colour with alpha 1 where it changed a pixel, composited with `glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE)`. Since the sky-reflection change SSR works in linear light with the split-sum weight (albedo-tinted for metals), so it looks somewhat different from before even in levels without a sky. |
+| `volumetric_fog_pass` | Ray-marched height fog lit by the directional light through the cascaded shadow maps (sun shafts) plus an ambient term in the fog colour; per-pixel dithered start so TAA averages the banding. Composited as `scene * transmittance + in-scatter`. |
+| `bloom_pass`, `dof_pass`, `particle_pass` | Post and transparent stages. Post targets are bound without a clear (they are overwritten fully). Particles are not drawn when `render_pass_context::draw_particles` is off (the editor's diagnostic view modes); they still simulate. |
+| editor only: `billboard_pass`, `collider_gizmo_pass`, `outline_pass` | Editor overlays. |
+| `taa_pass` | Temporal anti-aliasing: the camera projection is jittered by a Halton sub-pixel offset each frame (`taa_renderer::apply_jitter`, before the pipeline runs), and the resolve blends the frame with a history buffer reprojected through the previous camera, clamped to the 3x3 neighbourhood. Camera-only reprojection (no per-object motion vectors). Last visible pass. |
+| editor only: `picking_pass` | Renders **only on the frame a click asked for a pick**. RGB of the buffer is the pick id; alpha is the material slot of the mesh section there (+1, 0 = none), which is how a material dropped in the viewport finds its slot. |
+
+Both shadow maps are bound as comparison samplers (`sampler2DArrayShadow` / `samplerCubeArrayShadow`, linear filtering, `GL_COMPARE_REF_TO_TEXTURE`): a lookup returns a hardware-filtered 2x2 depth comparison, not a depth. The cascade lookup adds a 3x3 tap kernel on top with a slope-scaled bias measured in texels; the fragment shader's `debugMode` 7/8/9 show the cascade-0 comparison, the cascade factor tinted by cascade, and the point-light shadow factor (8 and 9 are the editor's **Shadow Cascades** and **Point Light Shadows** view modes - see [Editor view modes](#editor-view-modes)).
+
+All four screen-space / temporal effects are configured per level on the `post_process_component` (SSAO, SSR, volumetric fog, TAA sections next to bloom and depth of field) and default to off; a scene without the component renders exactly as before. SSAO and SSR need the depth pre-pass (`depth_prepass_enabled`), which is what fills the gbuffer.
+
+The runtime UI is drawn last, straight into the scene target, as one draw call per run of quads that share a texture (a whole HUD is typically one or two draws). Quads arrive with their corners already transformed (widgets can be rotated and scaled); layout, text and quad generation live in `gui_layout.cpp`, shared with the editor's GUI Designer - see [Runtime UI](/ui).
+
+**Material slots.** A mesh asset is a list of sections (one GL mesh each) and a list of material slots taken from its source file; `submit_scene` emits one render item per section with the material of its slot - the mesh component's override, else the mesh asset's own material, else the default material. Sections that share a material and a mesh still sort together and instance as before. See the Editor guide.
+
+**Materials.** The forward fragment shader is assembled from `shaders/material/pbr_common.glsl` (structs, uniforms, BRDF, shadows) + a `surface()` function + `shaders/material/pbr_main.glsl` (the lit `main`). The built-in material is one such assembly; a project's `.wshader` files are others, compiled at run time by `material_shader_library` into a per-draw and an instanced program each, so batched static meshes keep instancing under a custom surface. The clustered forward pass uploads its per-frame uniforms (camera, sun, cascades, fog, SSAO, sky reflection, `time`, `debugMode`) to every program the library holds. `core_gl_shader` resolves `#include "file"` lines relative to the including file and can recompile a program in place, which is what keeps material pointers valid across shader edits. See [GLSL materials](/materials).
+
+## Editor view modes
+
+The editor Viewport's toolbar picks a view mode (`renderer::e_view_mode`, see the Editor guide); it reaches the renderer as `render_pass_context::view_mode`. WizmPlayer never sets it, so a game always draws lit.
+
+- `apply_view_mode()` (`renderer/render_pass.h`) runs once the editor has filled the context and **before** `taa_renderer::apply_jitter`, which reads `taa_enabled`. It fills `shader_debug_mode` from the mode, turns TAA and depth of field off for every mode but Lit, and for the diagnostic modes also the sky (`draw_skybox`), particles (`draw_particles`), bloom, volumetric fog, SSAO and SSR - for that frame only; the level's post-process component is not touched. The depth pre-pass stays on in every mode and nothing in these modes writes depth, so the scene depth, and with it picking, mesh drops, SSR and the editor overlays, behaves as in Lit. A TAA switched off drops its history, so going back to Lit does not ghost.
+- `cluster_renderer::configure_forward_shader` uploads `debugMode = shader_debug_mode` to every forward program each frame: both default programs and every GLSL-material program. A program built or rebuilt mid-session starts at 0 (`initialise_forward_program`) and is caught up the same frame.
+- The `debugMode` values; the `k_debug_*` constants in `render_pass.h` and the `DEBUG_*` constants in `pbr_common.glsl` must match:
+
+| `debugMode` | Shows |
+|---|---|
+| 0 | The lit frame (also Lit Wireframe's surfaces). |
+| 1-7 | Raw developer views, not in the UI: grid lines, light count / 10, cluster index bytes, per-light colours, tile squares, a normal preview, the cascade-0 comparison. |
+| 8 / 9 | Shadow Cascades / Point Light Shadows. |
+| 10 / 11 | Wireframe's visible / hidden edges. |
+| 12 | Lit Wireframe's line draw: the pixel is shaded like the surface, then mixed 60% toward a contrasting colour. |
+| 13 | Light Complexity: the point + spot lights in the pixel's cluster as a 7-stop log2 gradient (0, 1, 2, 4, 8, 16, 32+), times a view-facing shade, tile borders darkened. |
+| 14 | Cluster Grid: lit, with 1-px tile borders and anti-aliased depth-slice contours (from derivatives, taken before `surface()`). |
+| 15 | Cluster Depth Slices: a golden-ratio hue per depth slice, shaded. |
+| 16 | Light Coverage: the average of a hue per light in the cluster (spot lights offset half way round the wheel). |
+
+The replacing branches (8-11, 13, 15, 16) return before `surface()`, write alpha 1 and leave the material / environment targets at "reflects nothing". 12 and 14 shade fully and only change the final colour - after the fog, and at the unlit return too, so unlit GLSL materials show them.
+
+- Wireframe mechanics: the forward pass skips its draw, so the clear colour stays; `wireframe_overlay_pass` then draws the hidden edges with `GL_GREATER` (dim) and the visible edges with `GL_LEQUAL` plus `glPolygonOffset(-1, -1)` / `GL_POLYGON_OFFSET_LINE`, under `glPolygonMode(GL_FRONT_AND_BACK, GL_LINE)` with depth writes off. Culling is off for Wireframe (back faces show) and on for Lit Wireframe. The pass switches the programs' `debugMode` per draw with `cluster_renderer::set_forward_debug_mode`, and restores `GL_FILL`, the depth state and `shader_debug_mode` before it returns. It runs after `skybox_pass`, because the sky draws wherever the depth is still 1 and would paint over the line pixels of silhouettes, and it reuses the forward pass's per-frame uniforms and texture units 2/7-10: nothing that rebinds those may go between the two.
+- Lines are 1 px (no `glLineWidth`). Each line draw rebuilds the instance batches and appends them to the instance ring again, so Wireframe costs two extra scene draws and Lit Wireframe one.
+- To force a raw view from a temporary diagnostics hook, set `frame_context.shader_debug_mode = n` after the context is filled (in the editor, after `apply_view_mode`). A one-off `setInt("debugMode", n)` on the programs is overwritten on the next frame.
+
+## Optimisation techniques
+
+- **Frustum culling** (CPU, parallel) with cached per-mesh bounding spheres, per pass: the main camera for pre-pass/forward/picking, each cascade's light frustum, each point light's influence sphere.
+- **Light culling** before cluster assignment: a light whose sphere can't touch the frustum is dropped from the cluster pass, the shadow pass and the shading pass alike (they all read the same list, so point-shadow slots stay aligned).
+- **Sorting** by a packed 64-bit key (material index, then mesh index), so state changes are minimised and instance batches fall out of a linear scan without hashing.
+- **GPU instancing** of all static meshes sharing mesh + material, in the pre-pass, the forward pass and every shadow pass. Skinned meshes stay single draws (each has its own bone palette).
+- **Shared instance ring buffer**: one persistently-mapped GL buffer (`GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT`), three regions used round-robin with fence syncs, that every mesh VAO points its per-instance attributes at. Each pass appends its instance matrices with a `memcpy` and draws with `glDrawElementsInstancedBaseInstance` — zero `glBufferData` calls per draw. Grows (and re-points every VAO) if a frame ever needs more than the region holds.
+- **Depth pre-pass** so the expensive forward fragment shader (PBR, cluster light loops, PCF shadows) only runs for visible surfaces. The pre-pass and forward vertex shaders compute `gl_Position` with the same expression and declare it `invariant`, which is what makes the `GL_LEQUAL` test exact instead of z-fighting.
+- **Back-face culling** in the opaque passes (`render_pass_context::cull_backfaces`).
+- **No per-draw uniform lookups by name**: `core_gl_shader` caches uniform locations with heterogeneous `string_view` lookup, so passing a string literal never allocates; array uniforms cache their `[0]` location too. Sampler unit assignments are uploaded once per program at creation, not per material bind.
+- **No `glGet*` state readbacks** in the hot passes: each pass restores the frame's target framebuffer/viewport from the pass context instead of querying GL.
+- **DSA texture binds** (`glBindTextureUnit`) — one call instead of two per texture.
+- **Cached local transforms** in `node_3d`: the TRS matrix is rebuilt only after a setter ran, instead of three axis rotations per component per system per frame.
+- **Reused scratch storage** in `render_queue` — visibility masks, instance data and batch lists are members that keep their capacity across frames.
+
+The editor's **Stats** panel shows the effect: mesh items submitted vs. in view, total draw calls, how many of those were instanced batches and how many instances they covered, and lights submitted vs. in view.
+
+## Switches worth knowing
+
+- `render_pass_context::depth_prepass_enabled` and `cull_backfaces` (set in both `main.cpp`s) — turn off if a scene relies on double-sided or inverted-winding meshes.
+- `render_pass_context::view_mode`, `apply_view_mode()` and `shader_debug_mode` — the editor's view modes (see [Editor view modes](#editor-view-modes)), with the `draw_skybox` / `draw_particles` gates they switch. WizmPlayer leaves them all at their lit defaults; a diagnostics hook can set `shader_debug_mode` to any raw `debugMode`.
+- `instance_buffer::k_initial_region_capacity` (4096 instances per region) — the ring grows automatically; raise it if the grow message ever shows up in a profile.
+- `shadow_renderer` resolution (4096) and `point_shadow_renderer` resolution (1024) are constructor defaults; `m_shadow_max_distance` (300) and `m_split_lambda` (0.8) in `shadow_renderer.h` set how far shadows reach and how tightly the first cascade hugs the camera.
+- `camera_3d::get_projection_matrix()` includes the TAA jitter; anything that must be stable frame to frame (the cluster grid, TAA's own reprojection) uses `get_unjittered_projection_matrix()`. Screen-space passes that reconstruct positions from the depth buffer must use the jittered one, since that is what the depth was rendered with.
+- SSAO kernel size (16), SSR step count (48) and the TAA jitter sequence length (8) are constants in their renderers' .cpp files.
+- Sky reflections: face size limits, prefilter sample count and BRDF table size are constants at the top of `environment_renderer.cpp`; the mip count is `environment_renderer::k_prefilter_levels`. Sky reflections are not occluded by anything but AO: there are no local reflection probes, so interiors under an open sky reflect the sky too - lower the skybox's **Reflection Intensity** there, or turn on SSR, which replaces the sky wherever its rays hit geometry. Faces are capped at 512 px, so a mirror shows a 4K panorama at about half its on-screen sharpness; and because the sky is clipped at display white before it is reflected, a mirrored sun is at most white and blooms less than the sun in the sky itself.

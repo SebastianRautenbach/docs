@@ -1,0 +1,107 @@
+---
+title: "GLSL materials"
+sidebarTitle: "Materials"
+description: "Write a GLSL surface function in a .wshader file, let the engine light it with its forward renderer, and expose its uniforms as material parameters."
+icon: "palette"
+---
+
+A material can be **coded**: a `.wshader` file holds a GLSL *surface function* and the uniforms it wants, and the engine wraps it in its own forward lighting (clustered lights, cascaded and point shadows, skybox reflections, SSAO, fog, the G-buffer outputs) at run time. You write what the surface looks like; the renderer lights it exactly like the built-in material.
+
+- Shader files live in the project's content folder like any asset (`Game/Shaders/*.wshader`); the content browser imports them on sight.
+- A **Material** picks a shader in its **Shader** slot. Every `uniform` the shader declares becomes a parameter of that material, edited in the Material Editor and saved in the `.wmat`. Several materials can share one shader with different values, like Unreal material instances.
+- The **Shader Editor** (double-click a shader tile, or **Edit** next to a material's **Shader** slot) edits the code in place, compiles on Ctrl+Enter, and shows the driver's errors. Editing the file in an external editor works too: the editor polls `.wshader` files every half second and recompiles what changed. Materials update live. The window title shows `*` while the shader has changes that aren't in its file: **Save** (Ctrl+S) compiles and writes it; **Save All** (Ctrl+Shift+S) writes it too, compiling text typed since the last **Compile** first; **Reload From Disk** throws both away and rebuilds the shader from the file.
+- A shader that fails to build keeps its **last good build**; a shader that never built renders its materials with the default surface. Meshes never disappear while you fix a typo.
+
+## The surface function
+
+```glsl
+// Every uniform becomes a Material Editor parameter. Hints after `//` shape its editor.
+uniform vec4 Tint = vec4(1.0, 0.55, 0.15, 1.0);   // color
+uniform float PulseSpeed = 2.0;                   // range(0, 10)
+uniform float Glow = 1.5;                         // range(0, 8)
+uniform sampler2D Pattern;
+
+void surface(in SurfaceInput i, inout SurfaceOutput o)
+{
+    DefaultSurface(i, o);                         // the Material Editor's texture slots and factors...
+    o.albedo *= Tint.rgb * texture(Pattern, i.uv).rgb;
+    o.emissive += Tint.rgb * Glow * (0.5 + 0.5 * sin(time * PulseSpeed));
+}
+```
+
+`surface` runs once per fragment. It receives:
+
+| `SurfaceInput` | |
+|---|---|
+| `vec3 worldPos` | world-space position |
+| `vec3 worldNormal` | interpolated vertex normal, normalized, no normal map applied |
+| `vec3 viewDir` | normalized direction from the surface to the camera |
+| `vec2 uv` | the mesh's texture coordinates |
+| `mat3 tbn` | tangent / bitangent / normal frame in world space (for your own normal maps: `normalize(i.tbn * (texture(Map, i.uv).rgb * 2.0 - 1.0))`) |
+| `vec2 screenUV` | 0..1 across the render target |
+| `float viewDepth` | linear distance along the camera's forward axis |
+
+and fills:
+
+| `SurfaceOutput` | default | |
+|---|---|---|
+| `vec3 albedo` | white | base colour (linear) |
+| `vec3 normal` | `worldNormal` | world-space shading normal, renormalized afterwards |
+| `float metallic` | 0 | |
+| `float roughness` | 0.5 | clamped to 0.045..1 |
+| `float ao` | 1 | ambient occlusion |
+| `vec3 emissive` | 0 | HDR radiance added after lighting (bloom picks it up) |
+| `bool unlit` | false | true writes `albedo` straight to the target: no lights, shadows or fog |
+| `float alpha` | 1 | reserved: the forward pass is opaque today, alpha is ignored |
+
+Always available inside the function:
+
+- `DefaultSurface(i, o)` - the built-in material: samples the Material Editor's albedo / metallic / roughness / normal / AO / emissive slots and factors into `o`. Call it first and adjust, or ignore it and build every output yourself.
+- `SampleNormalMap(uv, tbn)` - the Material Editor's normal map through a tangent frame.
+- `material.*` - the raw slots (`material.albedo` etc. samplers, `material.metallicFactor`, `material.roughnessFactor`, `material.emissiveFactor`) and the `hasNormalMap` / `hasMetallicMap` / ... flags.
+- `time` - seconds since the application started.
+- `camPos`, `camFront`, `screenDimensions`, `zNear`, `zFar`, `fogColor`, `fogDensity`, `fogStart`, and the lighting functions of `shaders/material/pbr_common.glsl` (`CookTorrance`, `ShadowCalculation`, ...) if you want them.
+
+The composed program is `#version 450 core` + `shaders/material/pbr_common.glsl` + your file + `shaders/material/pbr_main.glsl`; the Shader Editor's **Show composed GLSL** shows exactly what the driver compiles. Your file becomes GLSL source string **100**, so a driver error `100(12)` (NVIDIA) or `ERROR: 100:12` (AMD / Intel) is line 12 of your `.wshader`.
+
+## Parameters
+
+A parameter is one `uniform` declaration on its own line:
+
+```text
+uniform <float|int|bool|vec2|vec3|vec4|sampler2D> Name [= <initializer>];   // [hints]
+```
+
+| Type | Editor | Notes |
+|---|---|---|
+| `float` | drag box, or a slider with `range(min, max)` | |
+| `int` | drag box / slider | |
+| `bool` | checkbox | |
+| `vec2`, `vec3`, `vec4` | drag boxes | a `vec3`/`vec4` with the `color` hint, or a name containing `color`, `colour` or `tint`, gets an HDR colour picker |
+| `sampler2D` | texture slot (accepts drops from the content browser) | bound in declaration order to texture units 11, 12, ... (0-10 are the engine's). The engine already uses 11 fragment samplers, so only 5 texture parameters are guaranteed on minimum-spec GL 4.5 hardware (16 units); desktop GPUs typically allow 21 |
+
+The initializer is the parameter's default (`vec4(1.0)`, `vec3(0.2, 0.5, 1.0)`, `2.0`, `true`). Hints: `color`, `range(a, b)`, `hide` (keeps it out of the editor). Values are stored in the `.wmat` by name, so renaming a uniform in the shader resets that parameter, and a parameter a material stored for a uniform the shader no longer declares is kept in the file until the material is saved with that uniform back.
+
+Uniform names must not collide with the engine's (`time`, `material`, `camPos`, `debugMode`, the shadow / fog / ssao / `environment*` uniforms in `pbr_common.glsl`), and functions must not redefine its helpers (`DefaultSurface`, `EnvironmentSpecularWeight`, `SpecularOcclusion`, `SampleEnvironment`, ...) or constants (`PI`, `MIN_ROUGHNESS`); the compiler reports a redefinition if they do. The editor's view modes (see [Editor view modes](/rendering#editor-view-modes)) add more engine names to avoid: the `DEBUG_*` constants and the helpers `debugHue`, `debugShade`, `debugWireColor`, `debugLitOverlay`, `clusterTileBorder`, `clusterSliceLine`, `lightComplexityColor` and `lightCoverageColor`. A GLSL material shows the view modes like the default one does: the debug views replace its colours before `surface()` runs, and Lit Wireframe and Cluster Grid draw over it, unlit materials included.
+
+## What a GLSL material can't do (yet)
+
+- **No vertex stage.** Vertex displacement would have to be mirrored in the depth pre-pass and both shadow passes, which draw with the engine's vertex shaders. Everything happens in the fragment surface function.
+- **Opaque only.** `alpha` is accepted and ignored; there is no blending or alpha clip in the forward pass (an alpha-clipped surface would still write its full depth in the pre-pass).
+- **Asset previews** (content-browser thumbnails) use the built-in surface, so a shader-driven look shows in the viewport, not on the tile.
+- Includes: `#include "file"` is resolved relative to `engine/WizmRender/shaders`, so a `.wshader` can pull in a shared file placed there; there is no project-level include path.
+
+## Files
+
+| File | Contents |
+|---|---|
+| `engine/WizmRender/shaders/material/pbr_common.glsl` | structs, uniforms, BRDF, shadows, `DefaultSurface` - shared by every forward program |
+| `engine/WizmRender/shaders/material/pbr_main.glsl` | the `main()` that calls `surface()` and lights the result |
+| `engine/WizmRender/shaders/default_frgmnt_shdr_new.glsl` | the built-in material: the two includes around a `surface()` that calls `DefaultSurface` |
+| `engine/WizmRender/includes/system/material_shader_library.h` | composes and compiles a surface source into the per-draw and instanced programs, recompiles in place |
+| `engine/WizmRender/includes/system/material_params.h` | the `uniform` parser and the parameter types |
+| `engine/WizmECS/includes/asset/assets/shader_asset.h` | the `.wshader` asset (source text, change polling, compile state) |
+| `engine/WizmECS/includes/asset/assets/material_asset.h` | `.wmat`: shader id + parameter values, builds the runtime material |
+| `engine/WizmGUI/includes/shader_editor_gui_layer.h` | the Shader Editor panel |
+
+Both applications create one `material_shader_library` pointed at the shader folder and attach it to the forward renderer (`cluster_renderer::attach_material_library`) and the asset manager (`asset_manager::set_material_shader_library`) before the project loads; the forward pass then uploads its per-frame uniforms to every program the library holds.

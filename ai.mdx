@@ -1,0 +1,325 @@
+---
+title: "AI"
+description: "Navigation meshes, nav agents, perception, AI controllers with blackboards, state machines, behaviour trees, steering and spawners, with the script API for each."
+icon: "brain"
+---
+
+WizardMachine's AI is built from the same parts Unreal and Unity use: a **navigation mesh** baked from the level, **nav agents** that find paths over it and walk them, a **perception** component that sees and hears, an **AI controller** holding a **blackboard** and running a **state machine** and **behaviour trees**, **steering** behaviours, and **spawners** with a small **AI manager** on top. Every part is a component or an asset, every part is scriptable, and each works on its own - a nav agent needs no behaviour tree, a behaviour tree needs no state machine.
+
+## Quick start
+
+A guard that patrols, chases the player on sight and goes back to patrolling when it loses them:
+
+<Steps>
+<Step title="Bake a navigation mesh">
+
+Add an empty entity to the level, give it a **Nav Mesh** component, size its bounds over the playable area, set the agent radius / height to your enemy's capsule, press **Bake**. Turn on **Navigation** in the viewport toolbar to see the result.
+
+</Step>
+<Step title="Build the enemy prefab">
+
+Character Controller + **Nav Agent** + **AI Perception** (Target Tags: `player`) + **AI Controller** + your script.
+
+</Step>
+<Step title="Add the logic">
+
+**+ Add > New Behavior Tree** twice - `Patrol` (Sequence: Wander, Wait) and `Chase` (Move To `target`) - and **+ Add > New AI State Machine** with two states running them and two transitions: `Patrol -> Chase` when `has_target` is set, `Chase -> Patrol` when it is not set. Assign the machine to the AI Controller.
+
+</Step>
+</Steps>
+
+No script is needed for any of that. Add one when the AI should *do* something - attack, play a bark, open fire:
+
+```cpp
+class guard
+{
+    float damage = 10.0f;
+
+    void OnAIStateEnter(string state)
+    {
+        if (state == "Chase") self().play_sound();
+    }
+
+    // A behaviour tree "Script Task" node named Strike calls this.
+    bt_status Strike(float dt)
+    {
+        entity@ target = self().get_ai_entity("target");
+        if (target is null) return bt_status::failure;
+
+        send_message(target, "damage", damage);
+        return bt_status::success;
+    }
+}
+```
+
+For a complete game built this way - melee, ranged, charging and boss enemies sharing seven trees and four machines, noise and damage reports, an AI Spawner, the manager's LOD - see "How the enemies think" in the FPS guide, which covers the first-person sample.
+
+## Navigation meshes
+
+### The Nav Mesh component
+
+One entity per level carries the **Nav Mesh** component (the AI system uses the first active one). It marks the volume to bake and keeps the result.
+
+| Field | Meaning |
+|---|---|
+| Center / Half Extents | The bake volume: a world-axis box around the entity. Never rotated. Shown in yellow. |
+| Agent Radius / Height | The capsule the mesh is baked for. Walkable floor is shrunk by the radius, so an agent's *centre* can stand anywhere on the mesh. |
+| Max Step Height | Highest ledge an agent steps onto (match the Character Controller's Step Offset). |
+| Max Slope | Steepest floor still walkable. |
+| Cell Size / Cell Height | Voxel size. Smaller follows walls closer and bakes slower; a third to half of the agent radius is a good cell size. |
+| Min Island Area | Walkable patches smaller than this are dropped (crate tops, unreachable ledges). |
+| Bake From | **Colliders** (default): box / sphere / capsule colliders of **Static** bodies - what a character controller really stands on. **Render Meshes**: triangles of visible static meshes. Or both. |
+| Include Kinematic Bodies | Off by default: doors and lifts move, so the mesh runs through their openings. |
+| Ignore Tag | Entities with this tag (default `nav_ignore`) are never baked. |
+| Baked Mesh | The `.wnavmesh` asset the component loads. |
+| Bake At Load When Missing | With no baked asset, bake from the scene the first time AI needs the mesh. On by default, so a level works before anyone pressed Bake. |
+
+### Baking
+
+**Bake** builds the mesh from the level as it is and saves it as `<Level>_NavMesh.wnavmesh` next to the level (baking again overwrites the same asset). Bake again after moving walls or floors. Dynamic bodies and character controllers are never part of the mesh.
+
+A level without a baked asset is baked when it starts (a line in the log says how long it took - tens of milliseconds for an arena, more for a large level in a Debug build). Scripts can force a re-bake with `nav_bake()`, for a level whose static geometry is assembled at run time.
+
+### How the mesh is built
+
+The bake voxelizes the geometry into columns (Recast's approach): colliders are filled as solids, so the inside of a crate is never "a room"; loose triangles are filled as surfaces. Spans too steep, too low under a ceiling, or closer to an edge than the agent radius are removed, small islands are dropped, and the remaining walkable cells are cut into **axis-aligned rectangles** that share **portals** along their edges. Each rectangle keeps its cells' floor heights, so ramps, stairs and floors above floors (bridges, mezzanines) work.
+
+Paths are found with A* over the rectangles and pulled tight with the funnel algorithm, so they cut corners cleanly and cross open floor in straight lines.
+
+## Pathfinding and nav agents
+
+### The Nav Agent component
+
+Walks its entity over the navigation mesh - Unity's NavMeshAgent. Give it a destination and it finds a path, follows it corner by corner with acceleration and turning, keeps clear of other agents, and reports progress.
+
+- **With a Character Controller** on the entity, the agent steers the controller (gravity, steps and walls behave as they do for the player). When it arrives or gives up it lets go, so a script can `move_character` for a lunge or a dodge.
+- **Without one**, the agent moves the transform itself and keeps the entity's feet on the mesh.
+- **With no navigation mesh in the level**, it walks straight at its goal.
+
+<Warning>
+
+Don't put a Nav Agent on an entity with a *Dynamic* rigidbody: physics owns that transform and overwrites the agent's moves. Use a Character Controller (or a Kinematic body) instead.
+
+</Warning>
+
+| Field | Meaning |
+|---|---|
+| Speed / Acceleration / Turn Speed | Movement limits. |
+| Stopping Distance | How close to the destination counts as arrived. |
+| Radius | Body size, for keeping apart from other agents. |
+| Automatic Feet Offset | Distance from the entity's origin down to its feet; automatic uses the Character Controller's capsule. |
+| Turn To Face Movement | Yaws the entity along its velocity (forward is -Z). |
+| Avoid Other Agents / Weight | Separation steering against nearby agents. |
+| Repath Interval | Seconds between re-paths while following a moving target. |
+
+An agent whose path is blocked by something the mesh doesn't know about (a closed door) notices it makes no headway, re-paths, and after a few tries fails (`OnPathFailed`).
+
+### Agent script API
+
+All on `entity`:
+
+| Function | |
+|---|---|
+| `bool agent_set_destination(vec3)` | Walk there. False when the entity has no Nav Agent. |
+| `void agent_follow(entity@)` | Keep walking to a moving entity. |
+| `void agent_wander(float radius)` | Random reachable points around where it stood when asked, pausing between them, until told otherwise. |
+| `void agent_flee(entity@, float distance)` / `agent_flee_from(vec3, float)` | Get at least `distance` away. |
+| `void agent_stop()` | Stand still, forget the destination. |
+| `void agent_warp(vec3)` | Teleport (moves the Character Controller too). |
+| `bool agent_is_moving()` / `agent_has_arrived()` / `agent_has_failed()` / `agent_has_path()` / `agent_is_path_partial()` | |
+| `string agent_get_status()` | `Idle`, `Pending`, `Moving`, `Arrived`, `Failed`. |
+| `float agent_get_remaining_distance()` | Along the path. |
+| `vec3 agent_get_velocity()` / `agent_get_destination()` | |
+| `float agent_get_speed()` / `void agent_set_speed(float)` / `void agent_set_stopping_distance(float)` | |
+
+A **partial** path ends at the closest reachable point when the destination itself can't be reached.
+
+### Navigation queries
+
+Global functions; all return harmless values when the level has no mesh.
+
+| Function | |
+|---|---|
+| `bool nav_is_ready()` | |
+| `bool nav_closest_point(vec3 p, float range, vec3 &out point)` | Nearest point on the mesh within `range`. |
+| `bool nav_is_on_mesh(vec3 p, float tolerance)` | |
+| `vec3 nav_random_point()` / `nav_random_point_in_radius(vec3 centre, float radius)` | The second only returns points that can be walked to from `centre`. |
+| `bool nav_raycast(vec3 from, vec3 to, vec3 &out point)` | True when the straight walk is blocked; `point` is where it ended. "Can I walk straight there?" |
+| `int nav_find_path(vec3 from, vec3 to)` | Returns the corner count; read the corners with `nav_path_point(i)`, and `nav_path_is_partial()`. |
+| `float nav_path_length(vec3 from, vec3 to)` | Walking distance, -1 when unreachable. |
+| `bool nav_bake()` | Re-bake from the scene now (not saved). |
+
+## The AI controller and its blackboard
+
+The **AI Controller** component is the brain. It owns the **blackboard** - the AI's named memory, which perception writes, conditions read and scripts do both - and runs the decision logic:
+
+- with a **State Machine** assigned, the machine picks the state and each state's behaviour tree runs while it is active;
+- with only a **Behavior Tree**, that tree runs on its own;
+- with neither, it is a blackboard and a team for scripts.
+
+| Field | Meaning |
+|---|---|
+| State Machine / Behavior Tree | The logic assets (drag a tile onto the entity, or pick here; **Open** edits it). |
+| Team | A number for the game to give meaning to (`ai_count_team`, `ai_find_nearest`). |
+| Think Interval | Seconds between decisions; 0 = every frame. Movement and perception keep their own pace. |
+| Enabled | Whether the brain runs. |
+| Blackboard Defaults | Values the blackboard starts with (Bool / Int / Float / String / Vec3). |
+
+Keys the engine writes:
+
+| Key | Type | Written by |
+|---|---|---|
+| `self`, `home` | entity, vec3 | the controller, when it starts |
+| `state` | string | the state machine |
+| `target`, `has_target`, `target_visible`, `target_position`, `target_distance` | entity, bool, bool, vec3, float | perception |
+| `heard_noise`, `noise_position` | bool, vec3 | perception |
+
+Script API (on `entity`): `set_ai_float / int / bool / string / vec3 / entity(key, value)`, `get_ai_float / int / bool / string / vec3(key, default)`, `get_ai_entity(key)`, `has_ai_value(key)`, `clear_ai_value(key)`. An entity stored on a blackboard is dropped automatically when it leaves the scene.
+
+Brain control: `get_ai_state()`, `is_ai_state(name)`, `set_ai_state(name)`, `get_ai_state_time()`, `fire_ai_event(name)`, `set_ai_enabled(bool)` / `is_ai_enabled()`, `restart_ai()`, `set_ai_behavior_tree(asset_id)`, `set_ai_state_machine(asset_id)`, `get_ai_team()` / `set_ai_team(int)`, `get_ai_task()` (the tree task that ran last, for debug text).
+
+While the game runs in the editor, select an AI entity: its Properties panel shows the live state, task and blackboard, and an open Behavior Tree / State Machine editor lights up what that entity is doing.
+
+## State machines (.wfsm)
+
+**+ Add > New AI State Machine**. States on the left, the ordered transition list below them, details on the right.
+
+A **state** has a name and, optionally, a behaviour tree that runs while the state is active. A **transition** fires when *all* of its requirements hold:
+
+- every **condition** - a blackboard key tested against a number or text (`==`, `!=`, `>`, `<`, `>=`, `<=`, *is set*, *is not set*; a key nobody has set compares as 0, a false bool is "not set");
+- the **event**, if named, was fired this frame (`entity.fire_ai_event("died")` or a tree's *Fire Event* task) - an event nobody was waiting for is forgotten, never delivered late;
+- the state has been active for **Min Time In State**;
+- the state's tree **succeeded / failed / finished**, if asked for.
+
+Transitions are tried top to bottom and at most one fires per think. **Any State** transitions apply everywhere but never re-enter the active state. On a change, the old state's tree is stopped (the agent too), then the script hears `OnAIStateExit(old)` and `OnAIStateEnter(new)`; `OnAIStateUpdate(state, dt)` runs every think.
+
+## Behaviour trees (.wbtree)
+
+**+ Add > New Behavior Tree**. The tree is an outline: right-click a node to add children, drag a node onto another to move it, **Move Up / Down** to reorder - children run top to bottom. A tree that finishes starts over on the next think.
+
+### Node reference
+
+**Composites**
+
+| Node | Does |
+|---|---|
+| Selector | Children in order until one doesn't fail. **Reactive**: every tick restarts from the first child, so an earlier branch takes over from a running later one (which is stopped). |
+| Sequence | Children in order until one fails. **Reactive**: earlier children are re-checked every tick - put conditions first; when one fails, the running child is stopped. |
+| Parallel | All children at once. Succeeds when all have (fails when one does), or - **Succeed When One Succeeds** - as soon as one has. |
+| Random Selector | A selector over a shuffled order. |
+
+**Decorators** (one child)
+
+| Node | Does |
+|---|---|
+| Inverter / Succeeder | Flip the result / always succeed. |
+| Repeat | Run the child N times (0 = forever), optionally stopping at the first failure. |
+| Cooldown | After the child finishes, fail for N seconds before letting it run again. |
+| Time Limit | Stop the child and fail when it takes longer than N seconds. |
+| Condition | A blackboard test. With a child it gates it; **Keep Watching** re-tests every tick and stops the child when it fails. Without a child it is a plain check. |
+| Script Condition | The same, calling `bool Name()` on the entity's script. |
+
+**Tasks**
+
+| Node | Does |
+|---|---|
+| Wait | N seconds, +/- a random amount. |
+| Move To | Walk to the entity or position in a blackboard key; succeeds within the acceptance radius, fails when there is no way. **Follow** keeps re-pathing to a moving target. Needs a Nav Agent. |
+| Wander | Walk to a random reachable point around `home`; succeeds on arrival. |
+| Flee | Get a safe distance from the key's entity / position. |
+| Face | Turn towards the key's entity / position. |
+| Stop | Stop the Nav Agent. |
+| Set Value / Clear Value | Write / remove a blackboard key. |
+| Script Task | Calls a method on the entity's script (below). |
+| Send Message | Delivers `OnMessage(name, value)` to the entity's own script. |
+| Fire Event | Fires a state machine event on this AI. |
+| Animation Trigger | Sets an animation graph trigger on the entity's skeletal mesh (its own or a child's). |
+| Log | Prints a line. |
+
+### Script tasks and conditions
+
+A **Script Task** named `Reload` calls, every tick until it stops returning `running`:
+
+```cpp
+bt_status Reload(float dt)
+{
+    reload_timer -= dt;
+    if (reload_timer > 0.0f) return bt_status::running;
+
+    ammo = clip_size;
+    return bt_status::success;
+}
+```
+
+`bool Reload(float)` (true = success) and `void Reload()` (always success) work too, with or without the `float`. A **Script Condition** calls `bool Name()`. A node naming a method the script doesn't have fails, and says so once in the log.
+
+## Perception
+
+The **AI Perception** component gives an entity senses. **Targets** are entities carrying any of its **Target Tags**.
+
+- **Sight**: within **Sight Range** and the **Field Of View** cone (360 = all around), with a **line-of-sight ray** through the physics scene from the eyes (**Eye Height** above the origin) to the target (**Target Height** above its origin). Once seen, a target stays seen out to **Lose Sight Range**, so it doesn't flicker at the edge. Checks run every **Update Interval**, staggered across AIs.
+- **Hearing**: scripts report noises - `ai_report_noise(position, loudness)` (the caller is the instigator) or `ai_report_noise(position, loudness, instigator)`. An AI hears one within both the noise's loudness (its reach) and its own **Hearing Range**. A noise made by a tagged target makes the AI aware of it at the noise's position.
+- **Damage**: `ai_report_damage(victim, instigator)` turns the victim's perception to the attacker at once, in sight or not, tagged or not.
+
+A target no longer sensed is remembered for **Memory** seconds - its last known position stays on the blackboard - and then lost.
+
+Script API (on `entity`): `get_perceived_target()` (nearest visible, else most recently sensed), `get_perceived_count()` / `get_perceived(i)`, `can_see(entity@)`, `is_aware_of(entity@)`, `get_last_known_position(entity@)`, and `has_line_of_sight(entity@)` - a sight ray right now, whatever perception last found.
+
+Callbacks: `OnTargetPerceived(entity@)` when a target enters the AI's awareness, `OnTargetLost(entity@)` when it is forgotten or gone (null then), `OnNoiseHeard(vec3 position, float loudness, entity@ instigator)`. Losing and regaining *sight* of a remembered target fires neither - read `target_visible` or `can_see`.
+
+## Steering
+
+The Nav Agent already seeks, arrives, and separates. For anything that doesn't walk a mesh - a drone, a fish, a strafing turret - the behaviours are script functions returning a desired velocity on the ground plane:
+
+| Function | |
+|---|---|
+| `vec3 steer_seek(vec3 position, vec3 target, float speed)` / `steer_flee(...)` | |
+| `vec3 steer_arrive(vec3 position, vec3 target, float speed, float slowing_radius)` | Seek that slows down and stops. |
+| `vec3 steer_pursue(vec3 position, float speed, vec3 target_position, vec3 target_velocity)` / `steer_evade(...)` | Aim where the target will be. |
+| `vec3 steer_wander(entity@ self, float speed)` | Meandering; keeps its heading per entity. |
+| `vec3 steer_separation(entity@ self, string tag, float radius, float speed)` | Away from tagged entities that are too close. |
+| `vec3 steer_avoid(entity@ self, vec3 velocity, float look_ahead, float speed)` | Casts a ray ahead through the physics scene; the sidestep that avoids what it hits. |
+| `float steer_yaw(vec3 direction, float fallback)` / `steer_turn(float current, float target, float max_step)` | Facing helpers (degrees, forward = -Z). |
+
+```cpp
+vec3 v = steer_pursue(me, 6.0f, prey.get_world_position(), prey_velocity)
+       + steer_separation(self(), "drone", 1.5f, 6.0f)
+       + steer_avoid(self(), velocity, 4.0f, 6.0f) * 2.0f;
+```
+
+## Spawning and management
+
+The **AI Spawner** component spawns a prefab in waves: **Spawns Per Wave** every **Interval** seconds after an **Initial Delay**, never more than **Max Alive** at once, **Total Limit** in all (0 = endless). Points are picked within **Spawn Radius** and snapped onto the navigation mesh; a Character Controller's capsule is lifted clear of the floor automatically. **Activation Distance** makes it spawn only while an entity with the **Activation Tag** is near; **Team For Spawns** stamps the spawn's AI Controller.
+
+Spawner API (on `entity`): `spawner_start()`, `spawner_stop()`, `spawner_restart()`, `spawner_spawn(int count)` (now, ignoring the timer and limits), `spawner_get_alive_count()`, `spawner_get_total_spawned()`, `spawner_is_running()`, `spawner_is_finished()`, `spawner_get_spawn(int)`, `spawner_set_prefab(string reference)`. Callbacks on the spawner's script: `OnAISpawned(entity@)` - the spawn's behaviours exist already, so `set_script_*` works on it - and `OnSpawnerFinished()` once the last spawn it will ever make is gone.
+
+The **AI manager** is a handful of global functions: `ai_get_count()`, `ai_count_team(int)`, `ai_get(int)`, `ai_find_nearest(vec3, int team, float max_distance)` (team -1 = any, never the caller), `ai_set_enabled(bool)` to freeze every brain, `ai_set_path_budget(int)` (path queries answered per frame, 8 by default - the rest wait a frame) and `ai_set_lod(far_distance, far_interval, sleep_distance)`: brains further than `far_distance` from the primary camera think only every `far_interval` seconds, and beyond `sleep_distance` not at all (0 turns either off).
+
+## Script callbacks
+
+All optional, on a script of the entity that carries the AI component. Snake-case spellings (`on_ai_state_enter`...) work too.
+
+| Callback | When |
+|---|---|
+| `void OnAIStateEnter(string state)` / `OnAIStateExit(string state)` | The state machine changed state. |
+| `void OnAIStateUpdate(string state, float dt)` | Every think, while in a state. |
+| `void OnTargetPerceived(entity@)` / `OnTargetLost(entity@)` | Perception. |
+| `void OnNoiseHeard(vec3 position, float loudness, entity@ instigator)` | Perception. |
+| `void OnDestinationReached()` / `OnPathFailed()` | Nav Agent. |
+| `void OnAISpawned(entity@)` / `OnSpawnerFinished()` | AI Spawner. |
+
+## Frame order
+
+`update_scripts` -> **`update_ai`** (noises and hits delivered, perception, brains, nav agents, spawners) -> `update_physics`. An order a script gives this frame is acted on this frame, and the velocity an agent gives its Character Controller is moved by physics right after. AI only runs while the game plays; in the editor, only the gizmos do.
+
+## Limitations
+
+- The mesh is static: doors and other moving obstacles aren't carved out of it. Leave them out of the bake and gate them in logic (a blocked agent re-paths, then fails).
+- No off-mesh links (jumps, ladders, teleporters) yet.
+- One navigation mesh, baked for one agent size, per level.
+- Polygons are axis-aligned rectangles, so a diagonal wall gets a stair-stepped edge (paths along it are still straight - the funnel sees to that); use a smaller cell size where that matters.
+- Agent avoidance is separation steering, not full reciprocal avoidance: dense crowds in narrow corridors will jostle.
+
+## Tests
+
+`engine/WizmECS/tests/ai/build_and_run.bat` builds and runs two standalone suites against the AI core (no engine, GL or PhysX needed): `nav_test` (bake, queries, A* + funnel, file round trip) and `brain_test` (blackboard, behaviour trees, state machines, steering).

@@ -1,0 +1,223 @@
+---
+title: "Runtime UI (WGUI)"
+sidebarTitle: "UI"
+description: "Build game UI as .wgui layouts in the GUI Designer, and drive the widgets from scripts with auto-binding and the widget API."
+icon: "window-maximize"
+---
+
+How game UI is built and driven: the widget model (modelled on Unreal's UMG), the GUI Designer in the editor, and the scripting side - including the automatic binding that turns a menu into "fields and handlers".
+
+A UI is a **`.wgui` layout asset** (a tree of widgets, authored in the GUI Designer) shown through a **GUI component** on an entity. A level can place the component itself (**Auto Show** draws it as soon as the game starts), or a script creates one with `CreateUI("UI/PauseMenu")`. The same layout can be shown by several entities at once; each gets its own copy of the widget state, so a script changing one HUD never touches another.
+
+## Widgets
+
+| Kind | Draws | Notes |
+|---|---|---|
+| **Panel** | a coloured / textured rectangle | the canvas panel: children place themselves with anchors |
+| **Text** | text from a `.wfont` | font size, justification, vertical alignment, word wrap, drop shadow, size-to-content |
+| **Image** | a texture, tinted | **Draw As** Image (stretch) or Box (9-slice with pixel-sized borders) |
+| **Button** | like a panel, reacts to the pointer | auto tint (brighter hovered, darker pressed) or a custom style with hovered / pressed colours and textures; children allowed (a label on a button) |
+| **Progress Bar** | background + a fill | `percent` 0..1, fill colour / texture, four fill directions |
+| **Check Box** | a box, with a mark when checked | toggles on click |
+| **Slider** | a track + a draggable handle | `value` in `min..max`, optional step, horizontal or vertical |
+| **Horizontal Box** / **Vertical Box** | nothing | lays its children out in a row / column (see below) |
+| **Spacer** | nothing | empty space in a box |
+
+Every widget has a name (scripts and the auto-binder find it by name), a colour and opacity, a visibility, an enabled flag, a z-order among its siblings, and a render transform. Children always draw over their parent; siblings draw in z-order, then authoring order.
+
+### Layout: canvas slots and boxes
+
+A widget whose parent is a panel (or the screen) has a **canvas slot**, laid out like UMG's:
+
+- **Anchors** are two points, *min* and *max*, as fractions of the parent's rectangle. Equal anchors pin the widget to one point: its **position** is an offset in pixels from that point, its **alignment** says which point of the widget lands there (0,0 top-left, 0.5,0.5 centre, 1,1 bottom-right), and it keeps its **size**. Different anchors *stretch* the widget between them on that axis, and **offsets** (left / top / right / bottom margins) then apply instead of position and size.
+- A text widget with **Size To Content** takes the size of its text (only the height when word wrap is on).
+
+So a health bar anchored at (0,1)-(0,1) with alignment (0,1) sits in the bottom-left corner of every screen size; a menu panel anchored (0.5,0.5) with alignment (0.5,0.5) is centred; a top bar anchored (0,0)-(1,0) with left/right offsets 0 spans the width.
+
+A child of a **box** ignores anchors. The box gives each child a **slot** along its axis: **auto** slots take the child's size, **fill** slots share the remaining space in proportion to their weight; each slot has **padding** (left, top, right, bottom) and a horizontal / vertical **alignment** (left / centre / right / fill) inside it. Boxes nest, and a box inside a panel is itself placed with a canvas slot.
+
+### Visibility and input
+
+| Visibility | Drawn | Takes space in a box | Takes the pointer |
+|---|---|---|---|
+| **Visible** | yes | yes | yes - a click here never reaches the game (a menu panel) |
+| **Self Hit Test Invisible** | yes | yes | no, but its children may (a HUD label) |
+| **Hit Test Invisible** | yes | yes | neither it nor its children |
+| **Hidden** | no | yes | no |
+| **Collapsed** | no | no | no |
+
+Buttons, check boxes and sliders default to **Visible**; everything else to **Self Hit Test Invisible**, so a HUD never swallows a gameplay click while a menu does. Disabled widgets draw at half opacity and ignore the pointer. `SetVisible(false)` from a script hides the widget and `SetVisible(true)` puts the visibility it had back.
+
+### Render transform
+
+Translation, scale, angle (degrees) and pivot (a fraction of the widget's rect) transform the widget *and its children* on screen; opacity multiplies down the tree. Hit-testing follows the transform, so a rotated button is clicked where it is drawn. Layout is computed untransformed (a rotated widget in a box still takes its untransformed slot).
+
+## The GUI Designer
+
+Double-click a `.wgui` in the content browser. The window has the **hierarchy** on the left, the **canvas** in the middle and the **details** on the right; the toolbar adds widgets (**+ Add Widget**, under the selected one), duplicates and deletes, picks the preview resolution, fits / zooms, and saves (**Save**, or the editor's **Save All** once the layout has unsaved changes).
+
+**Canvas.** The layout is laid out and drawn by the runtime's own code, at the chosen preview size, so what you see is what the game draws (fonts included). Click selects, drag moves, the eight handles resize; Alt+click cycles through the widgets stacked under the cursor, and a plain click keeps the selection when it is somewhere in that stack. Arrow keys nudge by a pixel (Shift: ten), Delete deletes, Ctrl+D duplicates, Escape deselects. The mouse wheel zooms around the cursor, middle-drag pans, **Fit** goes back to fit-to-window.
+
+**The move gizmo.** The selected widget always shows a gizmo drawn on top of everything: a white square at its centre moves it freely, the red arrow moves it along X only, the green arrow along Y only. The gizmo and the resize handles take priority over whatever is under the cursor, so a widget that sits under a larger one (a full-screen damage flash, a background panel) can be dragged without selecting the one on top. Moving a stretched widget shifts its offsets; moving a box child does nothing (the box places it - reorder it in the hierarchy).
+
+**Hierarchy.** Drag a row onto another to reparent it (dropping below the tree makes it a root); the right-click menu adds children, duplicates, deletes, changes z-order and makes a widget a root. The `o` toggle hides a widget in the designer only (the game still shows it); the `L` toggle **locks** it, so canvas clicks pass through it - the other way around the overlap problem.
+
+**Details.** **Slot (Canvas Panel)** has UMG's anchor picker (nine points, the stretch rows / columns, full stretch) - picking a preset keeps the widget where it is on screen and converts its position or offsets - plus position / size or offsets, alignment, z-order and size-to-content. **Slot (Horizontal/Vertical Box)** replaces it for box children. **Appearance** holds the kind-specific look, **Behavior** the visibility / enabled / designer flags, **Render Transform** the transform and opacity.
+
+Layouts are saved with **Save**, and by the editor's **Save All** while they have unsaved changes; older `.wgui` files (single anchor, `hit_test` flag) load unchanged and are written in the new form the next time they are saved.
+
+## Scripting
+
+Scripts see a UI as the entity that carries the GUI component, and widgets as handles (`Widget@` and its kinds). Names are PascalCase as in UMG.
+
+```cpp
+entity@ CreateUI(string layout);          // "UI/PauseMenu" (path without extension) or an asset id; shows it
+void    ShowUI(entity@ ui);   void HideUI(entity@ ui);   bool IsUIVisible(entity@ ui);
+void    DestroyUI(entity@ ui);
+bool    IsAnyUIShown();
+
+int     BindWidgets(entity@ ui);          // bind the calling behaviour's fields and On*_ handlers (see below)
+
+Widget@            FindWidget(entity@ ui, string name);       // any kind
+TextWidget@        FindText(entity@ ui, string name);         // null when the widget isn't a Text
+ImageWidget@       FindImage(entity@ ui, string name);
+ButtonWidget@      FindButton(entity@ ui, string name);
+ProgressBarWidget@ FindProgressBar(entity@ ui, string name);
+CheckBoxWidget@    FindCheckBox(entity@ ui, string name);
+SliderWidget@      FindSlider(entity@ ui, string name);
+
+// One-liners for the common HUD calls (false when there is no such widget).
+bool SetWidgetText(entity@ ui, string name, string text);
+bool SetWidgetVisible(entity@ ui, string name, bool visible);
+bool SetWidgetPercent(entity@ ui, string name, float percent);
+bool SetWidgetColor(entity@ ui, string name, vec4 color);
+```
+
+Widget lookup by name is exact first, then case-insensitive ignoring `_`, `-` and spaces, so `FindText(hud, "health_text")` finds `HealthText`.
+
+### Auto-binding widgets to a behaviour
+
+A behaviour that calls `CreateUI` (or `BindWidgets(ui)` for a UI it didn't create - one placed in the level) gets its widgets **by declaring them**, the way UMG's `BindWidget` and Blueprint event nodes work:
+
+```cpp
+class pause_menu
+{
+    // Fields named after widgets are filled when the UI is created. The type
+    // must match the widget's kind (Widget@ takes any kind).
+    TextWidget@ Title;
+    SliderWidget@ Volume;
+    CheckBoxWidget@ Invert_Look;      // binds to "InvertLook" too
+
+    private entity@ m_menu;
+
+    void Start()
+    {
+        @m_menu = CreateUI("UI/PauseMenu");   // fields and handlers below are bound right here
+        HideUI(m_menu);
+        Volume.SetValue(save_get_float("volume", 0.8f));
+    }
+
+    // Methods named On<Event>_<WidgetName> are bound as that widget's handlers.
+    void OnClicked_Resume()                 { HideUI(m_menu); SetInputModeGameOnly(); }
+    void OnClicked_Quit()                   { load_level("Levels/MainMenu.wmap"); }
+    void OnValueChanged_Volume(float value) { save_set_float("volume", value); }
+    void OnCheckStateChanged_InvertLook(bool checked) { invert = checked; }
+    void OnHovered_Resume()                 { Title.SetText("Back to the game"); }
+
+    void Update(float dt)
+    {
+        if (is_key_pressed(key::escape)) { ShowUI(m_menu); SetInputModeUIOnly(m_menu); }
+    }
+}
+```
+
+Events and their handler signatures: `OnClicked_X()`, `OnPressed_X()`, `OnReleased_X()`, `OnHovered_X()`, `OnUnhovered_X()` (any widget that takes the pointer), `OnCheckStateChanged_X(bool)`, `OnValueChanged_X(float)`. A handler may also take no argument. The explicit `BindOnClicked("MethodName")` family still works and accepts a global function name too.
+
+`CreateUI` binds silently (a field with no matching widget stays `null`, so a shared class works with several layouts); `BindWidgets` reports every miss and every kind mismatch with a warning.
+
+Handlers run with the full script API - `self()` is the entity whose behaviour bound them - after the frame's UI update, so a handler may hide or destroy the UI it came from.
+
+### Widget API
+
+Every kind has the `Widget` methods:
+
+```cpp
+string GetName();   widget_kind GetKind();   entity@ GetOwner();
+void SetVisible(bool);  bool GetVisible();
+void SetVisibility(widget_visibility);  widget_visibility GetVisibility();   // visible, hidden, collapsed, hit_test_invisible, self_hit_test_invisible
+void SetEnabled(bool);  bool GetEnabled();
+
+// canvas slot
+void SetPosition(float x, float y);  vec2 GetPosition();      // SetOffset / GetOffset are the same
+void SetSize(float w, float h);      vec2 GetSize();
+void SetAnchors(float min_x, float min_y, float max_x, float max_y);
+void SetAlignment(float x, float y);
+void SetZOrder(int);  int GetZOrder();
+void SetPadding(float l, float t, float r, float b);           // box slot
+
+// appearance
+void SetColor(vec4);  vec4 GetColor();   void SetTint(vec4);    // the same colour and opacity
+void SetTexture(string texture_asset_id);
+void SetOpacity(float);  float GetOpacity();
+
+// render transform
+void SetRenderTranslation(float x, float y);  vec2 GetRenderTranslation();
+void SetRenderScale(float x, float y);        vec2 GetRenderScale();
+void SetRenderAngle(float degrees);           float GetRenderAngle();
+void SetRenderPivot(float x, float y);
+
+vec2 GetScreenPosition();  vec2 GetScreenSize();   // where it was laid out last frame
+Widget@ GetParent();  int GetChildCount();  Widget@ GetChild(int);
+bool IsHovered();  bool IsPressed();
+void BindOnHovered(string);  void BindOnUnhovered(string);
+```
+
+plus per kind:
+
+```cpp
+// TextWidget
+void SetText(string);  string GetText();
+void SetFontSize(float px);  float GetFontSize();      // 0 = the font's baked size
+void SetJustification(text_justify);                   // left, center, right
+void SetWordWrap(bool);
+void SetShadow(float offset_x, float offset_y, vec4 color);
+
+// ButtonWidget
+void BindOnClicked(string);  void BindOnPressed(string);  void BindOnReleased(string);
+void SetHoveredColor(vec4);  void SetPressedColor(vec4);  // switches the button to its custom style
+
+// ProgressBarWidget
+void SetPercent(float);  float GetPercent();
+void SetFillColor(vec4);  void SetFillDirection(fill_direction);   // left_to_right, right_to_left, bottom_to_top, top_to_bottom
+
+// CheckBoxWidget
+void SetChecked(bool);  bool IsChecked();               // SetChecked raises no event
+void BindOnCheckStateChanged(string);                   // handler: void f(bool)
+
+// SliderWidget
+void SetValue(float);  float GetValue();                // clamped and stepped; no event
+void SetRange(float min, float max);  float GetMinValue();  float GetMaxValue();
+void SetStep(float);
+void BindOnValueChanged(string);                        // handler: void f(float)
+```
+
+`cast<TextWidget@>(w)` and friends convert a `Widget@` to its kind (null when it isn't one). Handles are valid for as long as the UI entity exists; keep them in fields, never across `DestroyUI`.
+
+Changes made through the API affect **that UI instance only** - the `.wgui` on disk is never touched. Anything set in the designer can be changed at run time this way, since the instance holds its own copy of the layout.
+
+### Input modes
+
+Unchanged from before and documented in the [Scripting reference](/scripting#input-modes): `SetInputModeGameOnly()`, `SetInputModeGameAndUI(ui)`, `SetInputModeUIOnly(ui)`, `GetInputMode()`, `GetFocusedUI()`, `SetFocusedUI()`, `IsPointerOverUI()`, `GetHoveredWidget()`. In the two UI modes every shown UI is hit-tested topmost-first; a widget being pressed captures the pointer until release; a slider follows the pointer while held.
+
+## Files
+
+| File | Contents |
+|---|---|
+| `engine/WizmECS/includes/asset/assets/gui_asset.h` | `widget_desc` (everything a widget is) and the `.wgui` asset |
+| `engine/WizmECS/includes/system/gui_layout.h` | the layout engine shared by the runtime and the designer: anchors / boxes / transforms, text layout, hit-testing, draw-item generation |
+| `engine/WizmECS/includes/component/components/gui_component.h` | a shown layout: its own widget copy, resolved assets, interaction state, event bindings |
+| `engine/WizmECS/includes/component/components/widget.h` | the script-facing widget handles and events |
+| `engine/WizmECS/src/system/gui_system.cpp` | `update_gui` (hover / press / release / slider drag, events) and `submit_gui` (quads for the UI renderer) |
+| `engine/WizmRender/includes/renderer/ui_renderer.h` | draws the quad list (already transformed corners) in as few draws as there are texture changes |
+| `engine/WizmGUI/includes/gui_editor_gui_layer.h` | the GUI Designer |
+| `engine/WizmECS/includes/system/scripting_functions.h` | the `Widget` bindings and the auto-binder (`bind_widgets_to_object`) |

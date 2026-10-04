@@ -11,7 +11,7 @@ The entire native binding surface documented here is implemented in one header, 
 
 For a walkthrough of a complete first-person game built on this API (player rig, hitscan weapon, enemies, pickups, HUD), see the FPS guide.
 
-The AI part of the API — navigation queries (`nav_*`), nav agents (`entity.agent_*`), the blackboard (`entity.set_ai_*` / `get_ai_*`), state machine and behaviour tree control, perception, spawners (`entity.spawner_*`), the AI manager (`ai_*`), steering (`steer_*`), the `bt_status` enum and the AI callbacks (`OnAIStateEnter`, `OnTargetPerceived`, `OnDestinationReached`...) — has its own page: the AI reference.
+The AI part of the API — navigation queries (`nav_*`), nav agents (`entity.agent_*`), the blackboard (`entity.set_ai_*` / `get_ai_*`), state machine and behaviour tree control, perception, spawners (`entity.spawner_*`), the AI manager (`ai_*`), steering (`steer_*`), the `bt_status` enum and the AI callbacks (`OnAIStateEnter`, `OnTargetPerceived`, `OnDestinationReached`...) — has its own page: the [AI reference](/ai).
 
 ## Overview
 
@@ -166,7 +166,7 @@ class gate
 }
 ```
 
-Ids of entities *inside* a prefab instance are regenerated on every load (see the Prefabs guide), so point a reference at a level entity or at an instance **root**, not at content nested inside an instance. A reference whose target can't be found when the behaviour is built is `null` (the editor shows it as `<missing>`). Like every entity handle, the field does **not** turn `null` when its entity is destroyed later - see [Language notes](#language-notes).
+Ids of entities *inside* a prefab instance are regenerated on every load (see [Prefabs](/prefabs)), so point a reference at a level entity or at an instance **root**, not at content nested inside an instance. A reference whose target can't be found when the behaviour is built is `null` (the editor shows it as `<missing>`). Like every entity handle, the field does **not** turn `null` when its entity is destroyed later - see [Language notes](#language-notes).
 
 ### Other behaviours' fields
 
@@ -224,7 +224,7 @@ Field values are the one part of a Scripting component a prefab instance may ove
 
 ### Buttons and other UI callbacks
 
-A behaviour that creates a UI declares its widgets and handlers and they are bound by name, UMG-style (see the UI reference):
+A behaviour that creates a UI declares its widgets and handlers and they are bound by name, UMG-style (see [Auto-binding widgets to a behaviour](/ui#auto-binding-widgets-to-a-behaviour)):
 
 ```cpp
 class main_menu
@@ -351,11 +351,11 @@ Identifies a component slot on an entity. Used by [Component management](#compon
 | `box_collider` | Not creatable via `add_component` |
 | `sphere_collider` | Not creatable via `add_component` |
 | `capsule_collider` | Not creatable via `add_component` |
-| `nav_mesh` | The level's navigation mesh — see the AI reference |
-| `nav_agent` | Path following — see the AI reference |
-| `ai_perception` | Sight and hearing — see the AI reference |
-| `ai_controller` | Blackboard, state machine, behaviour trees — see the AI reference |
-| `ai_spawner` | Wave spawner — see the AI reference |
+| `nav_mesh` | The level's navigation mesh — see [Navigation meshes](/ai#navigation-meshes) |
+| `nav_agent` | Path following — see [Pathfinding and nav agents](/ai#pathfinding-and-nav-agents) |
+| `ai_perception` | Sight and hearing — see [Perception](/ai#perception) |
+| `ai_controller` | Blackboard, state machine, behaviour trees — see [The AI controller and its blackboard](/ai#the-ai-controller-and-its-blackboard) |
+| `ai_spawner` | Wave spawner — see [Spawning and management](/ai#spawning-and-management) |
 
 <Note>
 
@@ -488,7 +488,7 @@ entity@ clone(string new_name);
 |---|---|
 | `get_guid()` | Stable unique identifier, usable with the global `find_entity(string)` |
 | `get_name()` / `set_name()` | Display name, usable with `find_entity_by_name(string)`. Renaming is not guaranteed unique. |
-| `get_tags()` / `set_tags()` | The raw tag string. Tags are whitespace/comma-separated tokens naming what an entity *is* (`enemy`, `pickup`, `door`), the way Unity's tags do. Edited in the Properties panel (**Tags**) and saved with the entity, level, or prefab. A prefab *instance* may override its prefab's tags, and the level stores the override (see the Prefabs guide) |
+| `get_tags()` / `set_tags()` | The raw tag string. Tags are whitespace/comma-separated tokens naming what an entity *is* (`enemy`, `pickup`, `door`), the way Unity's tags do. Edited in the Properties panel (**Tags**) and saved with the entity, level, or prefab. A prefab *instance* may override its prefab's tags, and the level stores the override (see [Prefabs](/prefabs)) |
 | `has_tag(tag)` | `true` if `tag` is one of the tokens (exact, case-sensitive match) |
 | `get_tag_value(key, default)` / `get_tag_float(key, default)` | **Legacy.** Value of a `key=value` token, or the default when the key is absent. This was how a script got its tuning before behaviour classes; parameters now belong in [inspector fields](#behaviour-classes-and-inspector-fields), which are typed, discoverable and per component. Kept so older scripts keep running |
 | `destroy()` | Queues the entity and its children for deletion. The deletion happens once every script has finished updating this frame, so a script may destroy its own entity, and handles stay valid for the rest of that update — after that they dangle, see [Language notes](#language-notes). `find_entity_by_name`, `find_entity_by_tag` and `send_message` already skip entities queued for deletion |
@@ -527,7 +527,7 @@ entity@ get_child(int index);
 
 <Note>
 
-A `.wprefab` file can only save **one root entity** — anything else must be saved as a nested child of that root, even entities that conceptually shouldn't inherit the root's rotation (a common example: a third-person orbit camera saved as a child of the player it follows, purely so it round-trips with the prefab). Instances placed in a level are rebuilt from the file on every load, so their contents are edited in the prefab editor rather than in the level — see the Prefabs guide. If a child needs a transform that's free of its parent's rotation at run time, detach it in `Start()`:
+A `.wprefab` file can only save **one root entity** — anything else must be saved as a nested child of that root, even entities that conceptually shouldn't inherit the root's rotation (a common example: a third-person orbit camera saved as a child of the player it follows, purely so it round-trips with the prefab). Instances placed in a level are rebuilt from the file on every load, so their contents are edited in the prefab editor rather than in the level — see [Prefabs](/prefabs). If a child needs a transform that's free of its parent's rotation at run time, detach it in `Start()`:
 
 ```cpp
 private entity@ m_camera;
@@ -646,7 +646,7 @@ if (visor >= 0)
 
 ### Animation
 
-Requires a `skeletal_mesh` component. The component plays either a single clip or an **animation graph** (a state machine driven by parameters - see the Animation guide); the calls below cover both, and clip names are a `.wanim` asset's file name or a clip embedded in the mesh.
+Requires a `skeletal_mesh` component. The component plays either a single clip or an **animation graph** (a state machine driven by parameters - see [Animation](/animation)); the calls below cover both, and clip names are a `.wanim` asset's file name or a clip embedded in the mesh.
 
 **Animation graph** (the component's Animation Mode set to *Animation Graph*, or `set_anim_graph` called):
 
@@ -983,7 +983,7 @@ entity@ spawn_prefab(string prefab_reference, vec3 world_position);
 | `spawn_entity(name)` | Creates a new, empty entity in the current scene at the origin |
 | `spawn_entity_at(name, position)` | Same, then sets its position |
 | `clone_entity(source, new_name)` | Deep-copies `source` (equivalent to `source.clone(new_name)`) |
-| `spawn_prefab(reference, world_position)` | Instantiates a `.wprefab` (see the Prefabs guide) as a new root entity at a world position. `reference` is relative to the project's `Game` folder, e.g. `"Prefabs/Enemy.wprefab"`. Returns `null` (and logs a warning) when the file isn't found |
+| `spawn_prefab(reference, world_position)` | Instantiates a `.wprefab` (see [Prefabs](/prefabs)) as a new root entity at a world position. `reference` is relative to the project's `Game` folder, e.g. `"Prefabs/Enemy.wprefab"`. Returns `null` (and logs a warning) when the file isn't found |
 
 **Remarks**
 
@@ -1102,7 +1102,7 @@ The request is remembered rather than applied immediately: the engine pushes the
 
 ### UI and widgets
 
-Runtime UI is a **GUI component** on an entity that references a `.wgui` layout asset authored in the editor's GUI Designer. The widget model follows Unreal's UMG: canvas panels with anchors, horizontal / vertical boxes, text, images, buttons, progress bars, check boxes and sliders, each with a visibility, a render transform and a z-order. **The UI reference covers this in full** - widget kinds, layout rules, the designer, the complete widget API and the auto-binding described below. This section is the short version.
+Runtime UI is a **GUI component** on an entity that references a `.wgui` layout asset authored in the editor's GUI Designer. The widget model follows Unreal's UMG: canvas panels with anchors, horizontal / vertical boxes, text, images, buttons, progress bars, check boxes and sliders, each with a visibility, a render transform and a z-order. **The [Runtime UI](/ui) page covers this in full** - widget kinds, layout rules, the designer, the complete widget API and the auto-binding described below. This section is the short version.
 
 ```cpp
 entity@ CreateUI(string layout);          // "UI/PlayerHud" (path without extension) or an asset id; shows it
@@ -1482,7 +1482,7 @@ A consolidated list of every non-obvious behavior called out in this document, f
 - **Raycasts only see physics shapes** (colliders and character controllers), never bare static meshes; trigger shapes never block. See [Raycasts](#raycasts).
 - **A character controller overwrites `set_position` every physics step** — teleport it with `set_character_position`. See [Physics](#physics).
 - **A `.wprefab` can only save one root entity.** Anything else must be a nested child, even if it logically shouldn't inherit the root's transform — detach it at run time with `set_parent(null)` instead. See [Hierarchy](#hierarchy-parenting).
-- **Prefab instances are rebuilt from their file on every level load**, and the entities inside them get fresh ids each time — find them by name, not by id. Only an instance root's name, position, rotation, tags, script field values and any scale axis changed on the instance belong to the level; everything else — its scale included — comes from the prefab. See the Prefabs guide.
+- **Prefab instances are rebuilt from their file on every level load**, and the entities inside them get fresh ids each time — find them by name, not by id. Only an instance root's name, position, rotation, tags, script field values and any scale axis changed on the instance belong to the level; everything else — its scale included — comes from the prefab. See [Prefabs](/prefabs).
 - **`load_level` is deferred** to the end of the frame's script update, and destroys every entity including the caller. Carry state across it in the save data. See [Levels](#levels).
 - **`entity.add_component()` can't create every `component_type`.** Only `static_mesh`, `sound`, `point_light`, `spot_light`, `directional_light`, `camera`, `skybox`, `fog`, `post_process`, and `skeletal_mesh` are runtime-creatable; `material` (there is no such component any more — materials live on the mesh component), `scripting`, `rigidbody`, the collider types, and `sprite` always return `false`. See [Component management](#component-management).
 - **Only a Dynamic rigidbody responds to forces/velocity.** Kinematic and Static bodies make every physics function in this API a no-op; move a Kinematic body with `set_position`/`set_rotation` instead. See [Physics](#physics).
