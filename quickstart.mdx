@@ -1,37 +1,72 @@
 ---
-
 title: "Quickstart"
-description: "Get started with WizardMachine and create your first script."
----------------------------------------------------------------------------
+description: "Create your first WizardMachine script and run it on an entity."
+---
 
-Welcome to WizardMachine! This quickstart will guide you through creating your first script and running it in your project.
-
-By the end of this guide, you will have created a script asset, opened it in your preferred IDE, and started writing your own behaviour.
+This quickstart walks you through creating a script, attaching it to an entity, and running it in Play mode.
 
 ## Prerequisites
 
 Before you begin, make sure you have:
 
-* **WizardMachine** installed from the Microsoft Store.
-* **Visual Studio Code** installed as your preferred IDE.
-* The **WIZMEXT** VS Code extension installed for syntax highlighting and code completion.
+* **WizardMachine** installed from the [Microsoft Store](https://apps.microsoft.com/detail/9nvdpg63kq7n).
+* A code editor. This guide uses **Visual Studio Code**.
+* The **WIZMEXT** VS Code extension, for syntax highlighting and code completion.
 
-## Get started
+## Create and run your first script
 
 <Steps>
   <Step title="Create a script">
-    Open the **Content Browser** in WizardMachine and create a new **Script Asset**.
+    In the **Content Browser**, select **\+ Add > New Script** and name it `hello`. WizardMachine creates a `hello.wscript` file containing a behaviour class named after the file, with empty `Start` and `Update` methods.
   </Step>
 
   <Step title="Open the script">
-    Open the script asset in your preferred native IDE, such as Visual Studio Code.
+    Open `hello.wscript` in Visual Studio Code.
   </Step>
 
   <Step title="Write your behaviour">
-    Start writing your gameplay behaviour using the WizardMachine scripting system.
+    Replace the contents with the following and save the file:
+
+    ```cpp
+        // hello.wscript
+    
+        class hello
+        {
+            string greeting = "Hello";
+    
+            void Start() {
+                log_info(greeting + " from " + self().get_name());
+            }
+    
+            void Update(float delta_time) {
+                // Spin the entity 45 degrees per second around its Y axis.
+                self().add_rotation(0.0f, 45.0f * delta_time, 0.0f);
+            }
+        }
+    ```
+
+    `Start` runs once before the first update, and `Update` runs every frame.
+  </Step>
+
+  <Step title="Add a Scripting component">
+    Select the entity you want to drive, then add a **Scripting** component from the **Add Component** menu.
+  </Step>
+
+  <Step title="Assign the script">
+    Assign `hello` to the Scripting component. The class's public fields, such as `greeting`, appear underneath it, where you can change them for this entity.
+  </Step>
+
+  <Step title="Enter Play mode">
+    Start the game. The entity spins, and the greeting is written to the log. Press **Stop** or `Escape` to end the session and restore the level to its pre-play state.
   </Step>
 </Steps>
 
+## Next steps
+
+<Card title="Scripting reference" icon="code" href="/scripting">
+  Explore the full entity API, input, physics, UI, and save data.
+</Card>
+
 <Tip>
-  Need help? Reach out to us at [sebastianrautenbachwork@gmail.com](mailto:sebastianrautenbachwork@gmail.com).
+  Need help? Reach out at [sebastianrautenbachwork@gmail.com](mailto:sebastianrautenbachwork@gmail.com).
 </Tip>
