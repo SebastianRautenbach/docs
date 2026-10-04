@@ -1,0 +1,1503 @@
+---
+title: "Scripting reference"
+sidebarTitle: "Scripting"
+description: "Drive WizardMachine entities at run time with AngelScript behaviour classes: the entity API, global functions, math library, data types, and lifecycle rules."
+icon: "code"
+---
+
+WizardMachine entities can be driven at run time by attaching a script written in **AngelScript** — a strongly-typed, C-like scripting language embedded in the engine (vendored at `vendor/angelscript`). This page is the complete reference for the scripting API exposed by the engine: the entity object model, global functions, math library, data types, and enumerations, together with the lifecycle rules and known quirks you need to know to use them correctly.
+
+The entire native binding surface documented here is implemented in one header, `engine/WizmECS/includes/system/scripting_functions.h`, inside `wizm::ecs::register_scripting_api()`.
+
+For a walkthrough of a complete first-person game built on this API (player rig, hitscan weapon, enemies, pickups, HUD), see the FPS guide.
+
+The AI part of the API — navigation queries (`nav_*`), nav agents (`entity.agent_*`), the blackboard (`entity.set_ai_*` / `get_ai_*`), state machine and behaviour tree control, perception, spawners (`entity.spawner_*`), the AI manager (`ai_*`), steering (`steer_*`), the `bt_status` enum and the AI callbacks (`OnAIStateEnter`, `OnTargetPerceived`, `OnDestinationReached`...) — has its own page: the AI reference.
+
+## Overview
+
+A script is a plain-text `.wscript` file containing AngelScript source. It declares a **behaviour class** — the engine's equivalent of a Unity `MonoBehaviour`. The file is imported as a `script_asset` and attached to an entity through a **Scripting** component (`scripting_component`), which owns a `script_controller`: the object that compiles the file, constructs one instance of the class for that entity, and drives its lifecycle every frame.
+
+```cpp
+// enemy_patrol.wscript - the class is named after the file
+
+class enemy_patrol
+{
+    // Public members are inspector fields: set them per entity in the
+    // Properties panel, no editor code required.
+    float speed = 3.0f;
+    int max_health = 100;
+    entity@ target;
+
+    // Private members are the behaviour's own state.
+    private float m_elapsed = 0.0f;
+
+    void Start()
+    {
+        log_info(self().get_name() + " patrols at " + to_string(speed));
+    }
+
+    void Update(float delta_time)
+    {
+        m_elapsed += delta_time;
+        self().add_rotation(0.0f, speed * delta_time, 0.0f);
+    }
+}
+```
+
+The methods the engine calls, all optional:
+
+| Method | Called |
+|---|---|
+| `void Start()` | Once, before the first `Update` (in Play mode, or on the frame after the entity is spawned). Every behaviour in the level already exists with its field values applied, so `Start` may read other entities' fields |
+| `void Update(float delta_time)` | Every frame, with the frame's delta time in seconds |
+| `void OnDestroy()` | Once, when the owning Scripting component is destroyed (entity destroyed, scene unloaded, or the script reloaded) |
+| `void OnMessage(string name, float value, entity@ sender)` | Whenever another script calls `send_message`/`broadcast_message` on this entity — see [Messaging between scripts](#messaging-between-scripts). The two-argument form `OnMessage(string, float)` is also accepted |
+
+The engine's older snake_case names (`on_start`, `on_update(float)`, `on_destroy`, `on_message`) are accepted as method names too, so a script written before classes keeps working once wrapped in a class.
+
+**Which class is the behaviour** is decided in this order:
+
+1. the class named after the file (`enemy_patrol` in `enemy_patrol.wscript`, case-insensitive) — the rule to rely on;
+2. otherwise, the only class in the file that declares an `Update(float)`;
+3. otherwise, the file's single class.
+
+Helper classes declared alongside the behaviour are left alone. A file that declares no class at all still runs through global `on_start` / `on_update(float)` / `on_destroy` / `on_message` functions — the pre-class form, kept working for older scripts, with no inspector fields.
+
+A class without `Update` is a perfectly good **data component**: it never ticks, but its fields are set per entity in the editor and read by other behaviours - a spawn point saying what spawns there, a level's settings. See [Other behaviours' fields](#other-behaviours-fields).
+
+A script exception at run time (a null handle, a division by zero) aborts only the call it happened in; it is logged with the file, line and entity, once per place, instead of silently skipping the rest of that `Update`.
+
+Each entity that runs a script gets its **own AngelScript module and its own class instance**, even when two entities point at the same `.wscript` file. This means:
+
+- Members are per-entity state: two enemies running `enemy_patrol` have their own `speed` and their own `m_elapsed`, and nothing is reset between frames.
+- Only a single file is compiled per script (`CScriptBuilder::AddSectionFromFile` is called once) — there is no `#include` mechanism. Keep each `.wscript` self-contained.
+
+## Getting started
+
+### Attaching a script to an entity
+
+<Steps>
+<Step title="Create the script">
+
+Create the script with **+ Add > New Script** in the Content Browser - a behaviour class named after the file, with an empty `Start` and `Update` (see the Editor guide) - or put a `.wscript` file into the project's `Game` folder or import one (**+ Add > Import...**); it is classified as a script asset by its extension.
+
+</Step>
+<Step title="Add a Scripting component">
+
+Select the target entity and add a **Scripting** component from the editor's **Add Component** menu.
+
+</Step>
+<Step title="Assign the script">
+
+Assign the imported script asset to the component. The class's public fields appear underneath it, each showing the value the script itself gives it — change the ones this entity needs.
+
+</Step>
+<Step title="Enter Play mode">
+
+`Start()` runs once, then `Update(float)` runs every frame. While the game runs, every editor panel is greyed out and ignores input; only the **Stop** button and `Escape` end the session, after which the level is restored to its pre-play state.
+
+</Step>
+</Steps>
+
+An entity can carry several Scripting components, each with its own script and its own field values, the way a GameObject carries several MonoBehaviours.
+
+<Note>
+
+A Scripting component can only be added through the editor. `entity.add_component(component_type::scripting)` from inside a script always fails — see [Component management](#component-management).
+
+</Note>
+
+### Minimal example
+
+```cpp
+// hello.wscript
+
+class hello
+{
+    string greeting = "Hello";
+
+    void Start() {
+        log_info(greeting + " from " + self().get_name());
+    }
+
+    void Update(float delta_time) {
+        // Spin the entity 45 degrees per second around its local Y axis.
+        self().add_rotation(0.0f, 45.0f * delta_time, 0.0f);
+    }
+}
+```
+
+## Behaviour classes and inspector fields
+
+A behaviour's **public members are its inspector fields**. The editor compiles the file, reads the class's members, and draws an editor for each one it can show — this is what a script is tuned with, instead of encoding parameters into the entity's tags.
+
+| Declared as | Editor | Notes |
+|---|---|---|
+| `bool` | Checkbox | |
+| `int` (any integer width) | Drag box | Stored as a 32-bit int |
+| `float`, `double` | Drag box | Stored as a `float` |
+| `string` | Text box | Any text; no escaping needed |
+| `vec3` | Three drag boxes | |
+| `vec4` | Four drag boxes, or a colour picker when the field's name contains `color`, `colour` or `tint` | |
+| `entity@` | Drop-down of the entities in the scene | An object reference, resolved when the behaviour is built |
+
+Members declared `private` or `protected` are the behaviour's own state and are never shown or stored. Members of any other type (arrays, other script classes, funcdefs) are ignored by the inspector — the script can still use them freely.
+
+**Only the values you change are stored.** A field left alone keeps whatever the script initialises it to, so editing a default in the `.wscript` reaches every entity that never overrode it; a field you change shows a **Reset** button that hands it back to the script. This is also why values are kept per field rather than per component: renaming or retyping a field in the script simply drops the stored value for it.
+
+Values reach the behaviour object right after it is constructed, well before `Start()`: when a level starts, every behaviour in it is built and given its values before the first `Start` runs, and a spawned prefab's behaviours are built inside `spawn_prefab` itself. Editing a `.wscript` and saving it is picked up immediately: the panel recompiles the file, shows the new fields, and reports a compile error next to the script instead of only on the console.
+
+### Object references
+
+An `entity@` field is stored as the target entity's id and resolved against the scene when the behaviour is built:
+
+```cpp
+class gate
+{
+    entity@ lever;              // assigned in the Properties panel
+    float open_height = 3.0f;
+
+    void Update(float delta_time)
+    {
+        // The lever's own behaviour has a public `bool pulled` field.
+        if (lever !is null && lever.get_script_bool("pulled", false))
+            self().add_position(0.0f, open_height * delta_time, 0.0f);
+    }
+}
+```
+
+Ids of entities *inside* a prefab instance are regenerated on every load (see the Prefabs guide), so point a reference at a level entity or at an instance **root**, not at content nested inside an instance. A reference whose target can't be found when the behaviour is built is `null` (the editor shows it as `<missing>`). Like every entity handle, the field does **not** turn `null` when its entity is destroyed later - see [Language notes](#language-notes).
+
+### Other behaviours' fields
+
+One behaviour reads or sets another's **public** fields through the entity that carries it - Unity's `GetComponent<T>().field`:
+
+```cpp
+entity@ get_script_entity(string field);
+bool   has_script_field(string field);
+
+float  get_script_float(string field, float default_value);
+int    get_script_int(string field, int default_value);
+bool   get_script_bool(string field, bool default_value);
+string get_script_string(string field, string default_value);
+vec3   get_script_vec3(string field, vec3 default_value);
+
+bool set_script_float(string field, float value);
+bool set_script_int(string field, int value);
+bool set_script_bool(string field, bool value);
+bool set_script_string(string field, string value);
+bool set_script_vec3(string field, vec3 value);
+bool set_script_entity(string field, entity@ value);
+```
+
+| Rule | |
+|---|---|
+| Which behaviour answers | Every Scripting component on the entity is asked in order: a get returns the first public field of that name, a set writes every component that declares one. `private`/`protected` members are unreachable - a get returns the default, a set returns `false` |
+| Types | Numbers convert between `int`, `float` and `bool`, so `set_script_float("area", 2)` fills an `int` field. Strings, `vec3` and entity handles must match |
+| Entity fields | `get_script_entity` only hands back an entity still in the scene, never a handle to one destroyed since |
+| Missing fields | A get returns the default you pass, a set returns `false` |
+
+This is how data travels between behaviours without tags. **Spawning** is the common case: `spawn_prefab` builds the new entity's behaviours on the spot (constructor and field values - Unity's `Awake`), so the spawner can hand over parameters before the new behaviour's `Start` runs on the next frame:
+
+```cpp
+entity@ projectile = spawn_prefab("Prefabs/Projectile.wprefab", muzzle);
+if (projectile !is null)
+{
+    projectile.set_look_rotation(pitch, yaw);
+    projectile.set_script_float("damage", damage);   // fps_projectile.damage
+    projectile.set_script_entity("owner", self());   // fps_projectile.owner - never hits its shooter
+}
+```
+
+**Reading** works the same way - a door asks the player whether it carries a key, a player asks the enemy it hit where its head is:
+
+```cpp
+bool unlocked = player.get_script_bool("has_key_red", false);
+float head_height = target.get_script_float("head_height", 0.9f);
+```
+
+Because a level's behaviours all exist before any `Start` runs, a `Start` can read data components anywhere in the level, whatever order the entities were loaded in.
+
+### Prefab instances
+
+Field values are the one part of a Scripting component a prefab instance may override. Placing the same `Enemy` prefab three times and giving each one a different `max_health` is an edit in the Properties panel; the level stores just those values, everything else still comes from the prefab file, and **Reset to Prefab** puts the prefab's own values back. Editing the prefab afterwards leaves the per-instance values alone.
+
+### Buttons and other UI callbacks
+
+A behaviour that creates a UI declares its widgets and handlers and they are bound by name, UMG-style (see the UI reference):
+
+```cpp
+class main_menu
+{
+    TextWidget@ Title;                 // filled from the widget named "Title" when the UI is created
+
+    void Start()
+    {
+        CreateUI("UI/MainMenu");
+        Title.SetText("WIZARD MACHINE");
+    }
+
+    void Update(float delta_time) {}
+
+    void OnClicked_PlayButton()        // bound to the button named "PlayButton"
+    {
+        load_level("Levels/e1_outpost.wmap");
+    }
+}
+```
+
+`BindOnClicked("MethodName")` still binds a handler by hand: a method of the behaviour class first, then a global function of the same name, for scripts that have not moved to a class.
+
+## Language notes
+
+The API surface is idiomatic AngelScript, with a few points specific to this engine worth calling out:
+
+- **Entity handles.** `entity` is a reference type (`entity@`). Assign with the `@` operator and compare against `null` with `is`/`!is`:
+
+  ```angelscript
+  entity@ target;
+  @target = find_entity_by_name("Camera");
+  if (target !is null) {
+      target.set_position(0.0f, 2.0f, 0.0f);
+  }
+  ```
+
+- **Entity handles do not keep entities alive.** The `entity` type is registered with `asOBJ_NOCOUNT` — AngelScript performs no reference counting on it. If something else calls `destroy()` on an entity (or the scene deletes it), any handle your script is still holding becomes a dangling pointer. Re-acquire handles (e.g. via `find_entity`/`find_entity_by_name`) rather than caching them across a destroy, if you can't guarantee lifetime.
+- **`self()`** returns the `entity@` handle for the entity that owns the currently-running script — the equivalent of Unity's `gameObject`. It is valid anywhere in the script: in `Start`/`Update`/`OnDestroy`/`OnMessage`, in any method or function they call, in a widget callback, and even in the class's constructor.
+- **Strings** use AngelScript's built-in `string` type (via the `scriptstdstring` add-on) and support `+` concatenation with other strings; convert numbers with `to_string` (see [Strings](#strings)).
+- **Script functions can take `const string &in` and recurse**, so helpers such as "find a child by name" are ordinary script code:
+
+  ```angelscript
+  entity@ find_child(entity@ parent, const string &in name) {
+      for (int i = 0; i < parent.get_child_count(); ++i) {
+          entity@ child = parent.get_child(i);
+          if (child.get_name() == name) return child;
+          entity@ nested = find_child(child, name);
+          if (nested !is null) return nested;
+      }
+      return null;
+  }
+  ```
+
+## Data types
+
+### vec2
+
+A plain 2-component float vector.
+
+```cpp
+vec2();
+vec2(float x, float y);
+```
+
+| Member | Type | Description |
+|---|---|---|
+| `x`, `y` | `float` | Components |
+| `vec2 opAdd(vec2) const` | | `a + b` |
+| `vec2 opSub(vec2) const` | | `a - b` |
+| `vec2 opMul(float) const` | | `a * scalar` |
+| `vec2 opDiv(float) const` | | `a / scalar` |
+| `vec2 opNeg() const` | | `-a` |
+| `float length() const` | | Euclidean length |
+| `vec2 normalized() const` | | Unit-length copy (returns `(0,0)` if length is 0) |
+| `float dot(vec2) const` | | Dot product |
+
+### vec3
+
+A plain 3-component float vector, used throughout for positions, rotations (Euler degrees), scale, and color.
+
+```cpp
+vec3();
+vec3(float x, float y, float z);
+```
+
+| Member | Type | Description |
+|---|---|---|
+| `x`, `y`, `z` | `float` | Components |
+| `vec3 opAdd(vec3) const` | | `a + b` |
+| `vec3 opSub(vec3) const` | | `a - b` |
+| `vec3 opMul(float) const` | | `a * scalar` |
+| `vec3 opDiv(float) const` | | `a / scalar` |
+| `vec3 opNeg() const` | | `-a` |
+| `float length() const` | | Euclidean length |
+| `vec3 normalized() const` | | Unit-length copy (returns `(0,0,0)` if length is 0) |
+| `float dot(vec3) const` | | Dot product |
+| `vec3 cross(vec3) const` | | Cross product |
+
+Both types are plain-old-data value types (no heap allocation, copied by value).
+
+## Enumerations
+
+### component_type
+
+Identifies a component slot on an entity. Used by [Component management](#component-management) and [Generic component properties](#generic-component-properties).
+
+| Value | Notes |
+|---|---|
+| `static_mesh` | |
+| `material` | Legacy name: there is no Material component any more. Names the entity's mesh component (static or skeletal), which holds the materials — see [Materials](#materials). Not creatable via `add_component` |
+| `sound` | FMOD-backed; supports 2D and 3D playback — see [Sound](#sound) |
+| `sprite` | Reserved; not creatable via `add_component` (see remark below) |
+| `point_light` | |
+| `spot_light` | |
+| `directional_light` | |
+| `camera` | |
+| `scripting` | Editor-only; not creatable via `add_component` |
+| `skybox` | |
+| `fog` | |
+| `post_process` | |
+| `skeletal_mesh` | |
+| `rigidbody` | Not creatable via `add_component` |
+| `box_collider` | Not creatable via `add_component` |
+| `sphere_collider` | Not creatable via `add_component` |
+| `capsule_collider` | Not creatable via `add_component` |
+| `nav_mesh` | The level's navigation mesh — see the AI reference |
+| `nav_agent` | Path following — see the AI reference |
+| `ai_perception` | Sight and hearing — see the AI reference |
+| `ai_controller` | Blackboard, state machine, behaviour trees — see the AI reference |
+| `ai_spawner` | Wave spawner — see the AI reference |
+
+<Note>
+
+Only `static_mesh`, `sound`, `point_light`, `spot_light`, `directional_light`, `camera`, `skybox`, `fog`, `post_process`, `skeletal_mesh`, and the five AI components can currently be added at run time via `entity.add_component()`. The remaining values exist for `has_component()`/property queries against components that were already added in the editor; calling `add_component()` with one of them always returns `false`.
+
+</Note>
+
+### key
+
+Passed to `is_key_down`/`is_key_pressed`/`is_key_released`.
+
+| Category | Values |
+|---|---|
+| Letters | `a`–`z` |
+| Digits | `zero`–`nine` |
+| Function keys | `f1`–`f12` |
+| Navigation | `up`, `down`, `left`, `right`, `home`, `end`, `page_up`, `page_down`, `insert`, `del` |
+| Editing | `enter`, `tab`, `backspace`, `escape`, `space` |
+| Modifiers | `left_shift`, `right_shift`, `left_control`, `right_control`, `left_alt`, `right_alt`, `left_super`, `right_super` |
+| Punctuation | `apostrophe`, `comma`, `minus`, `period`, `slash`, `semicolon`, `equal`, `left_bracket`, `right_bracket`, `backslash`, `grave_accent` |
+| Lock/toggle | `caps_lock`, `scroll_lock`, `num_lock` |
+| Other | `print_screen`, `pause`, `menu` |
+
+### mouse_button
+
+| Value |
+|---|
+| `left` |
+| `right` |
+| `middle` |
+
+## The `entity` object
+
+Every script has implicit access to `entity@` handles — its own, via `self()`, or others returned by lookup/spawn functions. All methods below are called as `some_entity.method(...)`.
+
+### Transform
+
+Local transform relative to the entity's parent (world space if it has none).
+
+```cpp
+vec3 get_position();
+void set_position(float x, float y, float z);
+void add_position(float x, float y, float z);
+
+vec3 get_rotation();
+void set_rotation(float x, float y, float z);
+void add_rotation(float x, float y, float z);
+
+vec3 get_scale();
+void set_scale(float x, float y, float z);
+void add_scale(float x, float y, float z);
+```
+
+| Parameter | Description |
+|---|---|
+| `x, y, z` (position/scale) | World-space-relative axis values |
+| `x, y, z` (rotation) | Euler angles in **degrees**, applied about the local X, Y, and Z axes respectively |
+
+**Remarks**
+
+<Warning>
+
+**Every entity, cameras included, uses one Euler convention.** Rotations compose as `Rx * Ry * Rz` with X outermost: `rotation.y` turns about world Y (yaw), `rotation.x` then tilts about the *world* X axis, `rotation.z` rolls. Local forward is **-Z**, so `rotation.y = 0` faces -Z and `rotation.y = 90` faces -X. Cameras and spot/directional lights all look down their entity's -Z, so a camera child (a first-person weapon, a flashlight) lines up with the view. (Older engine versions read a camera's `rotation.x` as yaw and `rotation.y` as pitch — that quirk is gone; a script written against it should switch to `set_look_rotation`.)
+
+Because X is applied *after* Y, `set_rotation(pitch, yaw, 0)` is **not** a look rotation once yaw is non-zero — it rolls the view. Anything that aims (cameras, heads, turrets) should use:
+
+```cpp
+void set_look_rotation(float pitch_degrees, float yaw_degrees);
+```
+
+which turns by `yaw` about world Y and then tilts by `pitch` about the entity's *own* X axis (positive pitch looks up), computing the equivalent XYZ triple for you. The alternative is to split the axes over a hierarchy — a body that only yaws with a head child that only pitches — which is what the first-person sample does.
+
+```cpp
+camera.set_look_rotation(cam_pitch, cam_yaw);   // orbit / free camera on a single entity
+self().set_rotation(0.0f, yaw, 0.0f);             // body: yaw only
+head.set_rotation(pitch, 0.0f, 0.0f);             // child of the body: pitch only
+```
+
+</Warning>
+
+Example:
+
+```cpp
+void Update(float delta_time) {
+    self().add_position(0.0f, 0.0f, -5.0f * delta_time); // move forward along local -Z
+    self().add_rotation(0.0f, 90.0f * delta_time, 0.0f);  // spin around local Y
+}
+```
+
+### World transform and direction vectors
+
+```cpp
+vec3 get_world_position();
+vec3 get_world_rotation();
+vec3 get_world_scale();
+void set_world_position(float x, float y, float z);
+
+vec3 get_forward();
+vec3 get_right();
+vec3 get_up();
+```
+
+Accessors for the entity's fully composed world-space transform (parent transforms folded in). `set_world_position` moves the entity so that its world position equals the given point, whatever its parent's transform is (a character controller ignores it — use `set_character_position`, see [Physics](#physics)).
+
+**Remarks**
+
+<Note>
+
+`get_forward()`, `get_right()`, and `get_up()` are the entity's local **-Z**, **+X** and **+Y** axes rotated by its full world matrix, normalised. They are meaningful on every entity: a camera's `get_forward()` is exactly what it looks at, a spotlight's is where it shines, a character's is the way its `rotation.y` faces. A mesh that was modelled facing +Z (Mixamo characters, for instance) shows its back along `get_forward()` — rotate that mesh child by 180° about Y inside its prefab if it matters. For a yaw-only entity, `forward == (-sin(yaw), 0, -cos(yaw))`, and the yaw that faces a direction `d` is `degrees(atan2(-d.x, -d.z))`.
+
+</Note>
+
+### Identity, naming, and tags
+
+```cpp
+string get_guid();
+string get_name();
+void   set_name(string name);
+string get_tags();
+void   set_tags(string tags);
+bool   has_tag(string tag);
+string get_tag_value(string key, string default_value);
+float  get_tag_float(string key, float default_value);
+
+void   destroy();
+entity@ clone(string new_name);
+```
+
+| Member | Description |
+|---|---|
+| `get_guid()` | Stable unique identifier, usable with the global `find_entity(string)` |
+| `get_name()` / `set_name()` | Display name, usable with `find_entity_by_name(string)`. Renaming is not guaranteed unique. |
+| `get_tags()` / `set_tags()` | The raw tag string. Tags are whitespace/comma-separated tokens naming what an entity *is* (`enemy`, `pickup`, `door`), the way Unity's tags do. Edited in the Properties panel (**Tags**) and saved with the entity, level, or prefab. A prefab *instance* may override its prefab's tags, and the level stores the override (see the Prefabs guide) |
+| `has_tag(tag)` | `true` if `tag` is one of the tokens (exact, case-sensitive match) |
+| `get_tag_value(key, default)` / `get_tag_float(key, default)` | **Legacy.** Value of a `key=value` token, or the default when the key is absent. This was how a script got its tuning before behaviour classes; parameters now belong in [inspector fields](#behaviour-classes-and-inspector-fields), which are typed, discoverable and per component. Kept so older scripts keep running |
+| `destroy()` | Queues the entity and its children for deletion. The deletion happens once every script has finished updating this frame, so a script may destroy its own entity, and handles stay valid for the rest of that update — after that they dangle, see [Language notes](#language-notes). `find_entity_by_name`, `find_entity_by_tag` and `send_message` already skip entities queued for deletion |
+| `clone(string new_name)` | Deep-copies the entity (and its component data) under a new name, returns the new instance |
+
+Example — an enemy whose tuning is inspector fields and whose tag says what it is:
+
+```cpp
+class enemy
+{
+    float health = 100.0f;   // set per entity in the Properties panel
+    float speed = 7.0f;
+
+    void Update(float delta_time) { /* ... */ }
+}
+```
+
+```cpp
+// in the weapon's behaviour - tags identify what was hit
+if (hit.hit_entity !is null && hit.hit_entity.has_tag("enemy"))
+    send_message(hit.hit_entity, "damage", 25.0f);
+```
+
+### Hierarchy (parenting)
+
+```cpp
+entity@ get_parent();
+void    set_parent(entity@ parent);
+int     get_child_count();
+entity@ get_child(int index);
+```
+
+`set_parent(null)` detaches the entity, making its local transform equal to world space.
+
+**Remarks**
+
+<Note>
+
+A `.wprefab` file can only save **one root entity** — anything else must be saved as a nested child of that root, even entities that conceptually shouldn't inherit the root's rotation (a common example: a third-person orbit camera saved as a child of the player it follows, purely so it round-trips with the prefab). Instances placed in a level are rebuilt from the file on every load, so their contents are edited in the prefab editor rather than in the level — see the Prefabs guide. If a child needs a transform that's free of its parent's rotation at run time, detach it in `Start()`:
+
+```cpp
+private entity@ m_camera;
+
+void Start() {
+    @m_camera = find_entity_by_name("Camera");
+    if (m_camera !is null) {
+        m_camera.set_parent(null); // free the camera from the player's rotation
+    }
+}
+```
+
+</Note>
+
+### Component management
+
+```cpp
+bool has_component(component_type type);
+bool add_component(component_type type);
+bool remove_component(component_type type);
+
+void set_component_active(component_type type, bool active);
+bool is_component_active(component_type type);
+void set_component_visible(component_type type, bool visible);
+bool is_component_visible(component_type type);
+```
+
+| Member | Description |
+|---|---|
+| `has_component()` | `true` if the entity currently has a component of that type |
+| `add_component()` | Adds a new, default-constructed component of that type. Returns `false` if the entity already has one, or if the type isn't runtime-creatable (see the [`component_type`](#component_type) note above) |
+| `remove_component()` | Removes the component of that type, if present |
+| `set_component_active()` / `is_component_active()` | Toggles whether the component participates in simulation/update at all |
+| `set_component_visible()` / `is_component_visible()` | Toggles rendering visibility without disabling the component's other behavior |
+
+Example — toggling a spotlight (from the flashlight example script):
+
+```cpp
+private bool m_is_on = true;
+
+void Update(float delta_time) {
+    if (is_key_pressed(key::f)) {
+        m_is_on = !m_is_on;
+        self().set_component_visible(component_type::spot_light, m_is_on);
+    }
+}
+```
+
+### Convenience setters
+
+Thin, type-safe wrappers over common properties on specific component types. Each is a no-op if the entity doesn't have the relevant component.
+
+```cpp
+void entity.set_mesh(string mesh_asset_id);
+
+void entity.set_light_intensity(float intensity);
+void entity.set_light_color(vec3 color);
+void entity.set_light_radius(float radius);
+
+void  entity.set_fov(float degrees);
+float entity.get_fov();
+void  entity.set_primary_camera(bool primary);
+
+void entity.set_skybox(string skybox_asset_id);
+void entity.set_fog(vec3 color, float density, float start);
+void entity.set_bloom(bool enabled, float threshold, float intensity);
+void entity.set_dof(bool enabled, float focus_distance, float focus_range);
+```
+
+| Member | Applies to | Notes |
+|---|---|---|
+| `set_mesh` | `static_mesh` | Sets `mesh_asset_id` |
+| `set_light_intensity` / `set_light_color` / `set_light_radius` | `point_light`, `spot_light`, or `directional_light` | Resolves whichever light component the entity has, in that order |
+| `set_fov` / `get_fov` | `camera` | `get_fov()` returns `60.0` if the entity has no camera component |
+| `set_primary_camera` | `camera` | Marks the camera used by `find_primary_camera()` |
+| `set_skybox` | `skybox` | |
+| `set_fog` | `fog` | Sets `color`, `density`, and `start` together |
+| `set_bloom` | `post_process` | Sets `bloom_enabled`, `bloom_threshold`, `bloom_intensity` together |
+| `set_dof` | `post_process` | Sets `dof_enabled`, `dof_focus_distance`, `dof_focus_range` together |
+
+### Materials
+
+Materials work the way they do in Unreal. A mesh asset has **material slots** — one per material of its source file, named after it — and brings a material of its own for each. The entity's mesh component (`static_mesh` or `skeletal_mesh`) may **override** any slot. A slot draws with its override, else the mesh's own material, else the project's default material. All of the calls below are no-ops (or return `0` / `""` / `-1`) on an entity without a mesh.
+
+```cpp
+int    entity.get_material_slot_count();
+string entity.get_material_slot_name(int slot);
+int    entity.find_material_slot(string slot_name);   // -1 when the mesh has no such slot
+
+string entity.get_material(int slot);                  // what the slot draws with ("" = default material)
+void   entity.set_material(int slot, string material_asset_id);   // "" removes the slot's override
+void   entity.set_material(string material_asset_id);  // one material over the whole mesh; "" removes it
+void   entity.reset_materials();                       // every override gone: the mesh's own materials again
+```
+
+`set_material(string)` sits **on top of** the per-slot overrides instead of replacing them, so a hit flash is two calls and leaves a multi-material character intact:
+
+```cpp
+mesh.set_material(hit_flash_material);   // everything flashes
+// ...a moment later:
+mesh.set_material("");                   // back to whatever each slot had
+```
+
+```cpp
+// Swap only the visor of a helmet mesh.
+int visor = self().find_material_slot("Visor");
+if (visor >= 0)
+    self().set_material(visor, cracked_visor_material);
+```
+
+<Note>
+
+**Scripts from before material slots keep working.** `component_type::material` names the mesh component, whose `material_asset_id` property reads the material of slot 0 and writes like `set_material(string)`. The old flash pattern — remember `get_string(component_type::material, "material_asset_id", "")`, `set_material(flash)`, then `set_material(remembered)` — still restores the look: putting slot 0's own material back is treated as "remove the whole-mesh material" rather than painting it over every slot.
+
+</Note>
+
+### Animation
+
+Requires a `skeletal_mesh` component. The component plays either a single clip or an **animation graph** (a state machine driven by parameters - see the Animation guide); the calls below cover both, and clip names are a `.wanim` asset's file name or a clip embedded in the mesh.
+
+**Animation graph** (the component's Animation Mode set to *Animation Graph*, or `set_anim_graph` called):
+
+```cpp
+void   entity.set_anim_graph(string graph_asset_id);
+string entity.get_anim_graph();
+
+void   entity.set_anim_float(string name, float value);   float entity.get_anim_float(string name);
+void   entity.set_anim_int(string name, int value);       int   entity.get_anim_int(string name);
+void   entity.set_anim_bool(string name, bool value);     bool  entity.get_anim_bool(string name);
+void   entity.set_anim_trigger(string name);
+void   entity.reset_anim_trigger(string name);
+
+string entity.get_anim_state();
+bool   entity.is_anim_state(string name);
+void   entity.play_anim_state(string name, float blend_seconds);
+float  entity.get_anim_state_time();
+float  entity.get_anim_state_normalized_time();
+bool   entity.is_anim_transitioning();
+```
+
+| Member | Description |
+|---|---|
+| `set_anim_graph` | Assigns a graph by asset id and switches the component to graph mode (empty id: back to single clip) |
+| `set_anim_float` / `int` / `bool` | Sets a parameter the graph's transitions and blend spaces read. A name the graph does not declare is kept until it does |
+| `set_anim_trigger` | Sets a trigger; the first transition whose conditions use it consumes it. `reset_anim_trigger` clears one that never fired |
+| `get_anim_state` | The state playing (during a cross-fade, the one being blended to) |
+| `play_anim_state` | Jumps to a state regardless of the transitions, cross-fading over `blend_seconds` - the escape hatch, like Unity's `Animator.Play` |
+| `get_anim_state_time` | Seconds into the current state; `get_anim_state_normalized_time` the same as 0..1 of its length |
+
+**Override slot** (either mode) - a clip played on top of whatever else plays, Unreal's montage:
+
+```cpp
+void  entity.play_animation_override(string clip_name, bool loop, float blend_in_seconds, float blend_out_seconds);
+void  entity.stop_animation_override(float blend_out_seconds);
+bool  entity.is_animation_override_playing();
+float entity.get_animation_length(string clip_name);
+```
+
+A non-looping override fades itself out so it ends exactly on its last frame; a looping one plays until `stop_animation_override`. Re-requesting the clip already playing keeps its place.
+
+**Single clip** (the older mode; unchanged):
+
+```cpp
+void   entity.play_animation(string clip_name, bool loop);
+void   entity.blend_to_animation(string clip_name, float blend_seconds, bool loop);
+void   entity.stop_animation();
+void   entity.set_animation_speed(float speed);
+bool   entity.is_animation_playing();
+float  entity.get_animation_time();
+string entity.get_current_animation_clip();
+```
+
+| Member | Description |
+|---|---|
+| `play_animation` | Plays `clip_name` immediately, optionally looping. With a graph assigned it plays the clip as an override instead, so older scripts keep working |
+| `blend_to_animation` | Cross-fades from the current clip to `clip_name` over `blend_seconds` (an override with that blend in graph mode) |
+| `stop_animation` | Stops playback (stops the override in graph mode) |
+| `set_animation_speed` | Sets `playback_speed` (1.0 = normal), which scales everything the component plays |
+| `is_animation_playing` | Whether anything plays |
+| `get_animation_time` | Seconds into the override if one plays, else into the state or the single clip |
+| `get_current_animation_clip` | The override's clip if one plays, else the state's clip or the single clip |
+
+**Callbacks** - optional methods on the behaviour class (or global functions in a class-less script). Events reach the scripts on the skeletal mesh's entity, or, when none of them has the handler, the nearest ancestor that does:
+
+```cpp
+void OnAnimationEvent(string name);                    // a clip notify was crossed
+void OnAnimationStateChanged(string from, string to);  // the graph entered a state (from is "" at start)
+```
+
+<Note>
+
+There is no root-motion extraction in this engine — a played clip's baked translation never moves the entity. Drive movement yourself (position/velocity), independent of which animation is playing.
+
+</Note>
+
+### Sound
+
+Requires a `sound` component. Playback is backed by FMOD; a sound asset is loaded once
+and can be played as either 2D or 3D depending on the component's `is_3d` property.
+
+```cpp
+void entity.play_sound();
+void entity.stop_sound();
+bool entity.is_sound_playing();
+```
+
+| Member | Description |
+|---|---|
+| `play_sound` | Starts (or restarts) playback of the component's assigned sound asset. No-op if no sound asset is assigned |
+| `stop_sound` | Stops playback immediately |
+| `is_sound_playing` | Whether the component's channel is currently playing |
+
+There's no dedicated wrapper for volume/pitch/loop/3D-ness - use the [generic component
+properties](#generic-component-properties) escape hatch:
+
+```cpp
+self().set_float(component_type::sound, "volume", 0.5f);
+self().set_float(component_type::sound, "pitch", 1.2f);
+self().set_bool(component_type::sound, "loop", true);
+self().set_bool(component_type::sound, "is_3d", false); // play as 2D (no distance attenuation/panning)
+```
+
+**Remarks**
+
+<Note>
+
+A 3D sound's position is synced from its entity's world position every frame while
+playing, and the 3D listener is the scene's primary camera (the same one
+`find_primary_camera()` resolves) - if no camera is marked primary, the listener
+defaults to the world origin facing `-Z`. A component with `play_on_start` set fires
+`play_sound()` automatically once per Play session; sounds only actually play while
+the scene is running (entering Play mode, or in WizmPlayer) - they do not autoplay
+while just editing a level.
+
+</Note>
+
+### Physics
+
+Requires a `rigidbody` component. Force, impulse, and velocity control only work on a **Dynamic** body.
+
+```cpp
+void entity.apply_force(float x, float y, float z);
+void entity.apply_impulse(float x, float y, float z);
+
+vec3 entity.get_linear_velocity();
+void entity.set_linear_velocity(float x, float y, float z);
+
+vec3 entity.get_angular_velocity();
+void entity.set_angular_velocity(float x, float y, float z);
+void entity.apply_impulse_at(float fx, float fy, float fz, float px, float py, float pz);
+```
+
+| Member | Description |
+|---|---|
+| `apply_force` | Continuous force in Newtons, applied for the current physics step |
+| `apply_impulse` | Instantaneous change in momentum |
+| `apply_impulse_at` | Impulse `(fx, fy, fz)` applied at the world-space point `(px, py, pz)` — a raycast hit, typically — so the body also spins |
+| `get_/set_linear_velocity` | Velocity in units/second |
+| `get_/set_angular_velocity` | Angular velocity in radians/second, per axis |
+
+**Character controller** — for an entity with a `character_controller` component (a capsule that sweeps through the world, with step-offset and slope limit; the player and enemies in the FPS sample):
+
+```cpp
+void entity.move_character(float vx, float vz);
+void entity.character_jump(float speed);
+bool entity.is_character_grounded();
+void entity.set_character_position(float x, float y, float z);
+```
+
+| Member | Description |
+|---|---|
+| `move_character(vx, vz)` | Desired horizontal velocity for this frame, in units/second; vertical motion is owned by gravity and jumping. Set it every frame (zero to stop) |
+| `character_jump(speed)` | Sets the vertical velocity — only while grounded. For an air jump or a knock-up, write the `vertical_velocity` [property](#generic-component-properties) directly: `self().set_float(component_type::character_controller, "vertical_velocity", 7.0f)` |
+| `is_character_grounded()` | `true` when the capsule stood on something during the last step |
+| `set_character_position(x, y, z)` | Teleports the controller to a world position and zeroes its fall speed. A plain `set_position` is overwritten by the controller every physics step, so use this for respawns and spawn points |
+
+**Remarks**
+
+<Warning>
+
+**Body type determines how you're allowed to move an entity:**
+
+| Body type | Move it with | Notes |
+|---|---|---|
+| `Static` | — | Never moves |
+| `Kinematic` | `set_position` / `set_rotation` / `add_position` | Script fully owns the transform; no gravity, and collisions never push it back |
+| `Dynamic` | `apply_force` / `apply_impulse` / `set_linear_velocity` / `set_angular_velocity` | Physics owns the transform after each simulation step — **direct `set_position`/`set_rotation` calls get silently overwritten next frame.** All physics functions above are no-ops (return a zero vector for getters) on anything other than a Dynamic body |
+
+**Exception:** if you lock a rotation axis on a Dynamic body (Properties > Rigidbody > Freeze Rotation), the simulation never writes that axis back onto the entity — so a script *can* safely call `set_rotation` directly for a locked axis, exactly like a non-physics entity, while still getting real physics-driven position from the body. This is the recommended pattern for a physics-based character that needs to face an arbitrary direction: lock rotation entirely and drive facing with `set_rotation`, rather than trying to steer yaw with `set_angular_velocity` (ground-contact friction imparts small uncorrected torque on unlocked axes, which accumulates into visible drift over time) or reading `get_rotation()` back into a turn-toward-target loop (the underlying Euler decomposition only round-trips within ±90° of the extracted axis, and aliases to a different, non-monotonic value beyond that — see the [third-person controller example](#complete-examples), which hits both issues and works around them).
+
+</Warning>
+
+### Raycasts
+
+```cpp
+raycast_hit raycast(vec3 origin, vec3 direction, float max_distance);
+raycast_hit raycast(vec3 origin, vec3 direction, float max_distance, entity@ ignore);
+```
+
+Casts a ray through the physics scene and returns the closest blocking hit. `raycast_hit` is a value type:
+
+| Field | Type | Description |
+|---|---|---|
+| `hit` | `bool` | `false` when nothing was hit within `max_distance` (the other fields are then zero/default) |
+| `hit_entity` | `entity@` | The entity owning the collider or character controller that was hit; `null` if the actor has no entity |
+| `point` | `vec3` | World-space impact point |
+| `normal` | `vec3` | Surface normal at the impact point |
+| `distance` | `float` | Distance from `origin` along the ray |
+
+**Remarks**
+
+- Only physics shapes are visible to rays: rigidbody colliders (box/sphere/capsule, Static/Kinematic/Dynamic) and character controllers. A static mesh without a collider is not hit. Trigger shapes never block.
+- `ignore` skips that entity *and everything parented under it* — pass `self()` when shooting from inside your own capsule.
+- `direction` does not have to be normalised.
+- The scene contains what physics knew about at the end of the last frame: an entity spawned this frame has no collider yet.
+
+```cpp
+vec3 origin = camera.get_world_position();
+vec3 direction = camera.get_forward();
+
+raycast_hit hit = raycast(origin, direction, 400.0f, self());
+if (hit.hit)
+{
+    spawn_prefab("Prefabs/BulletImpact.wprefab", hit.point + hit.normal * 0.05f);
+
+    if (hit.hit_entity !is null)
+    {
+        if (hit.hit_entity.has_component(component_type::rigidbody))
+            hit.hit_entity.apply_impulse_at(direction.x * 18.0f, direction.y * 18.0f, direction.z * 18.0f,
+                                            hit.point.x, hit.point.y, hit.point.z);
+
+        send_message(hit.hit_entity, "damage", 25.0f);
+    }
+}
+```
+
+### Generic component properties
+
+An escape hatch for reading/writing a named property on any component, by type, without a dedicated wrapper method:
+
+```cpp
+float  entity.get_float(component_type type, string property, float default_value);
+void   entity.set_float(component_type type, string property, float value);
+
+vec3   entity.get_vec3(component_type type, string property, vec3 default_value);
+void   entity.set_vec3(component_type type, string property, vec3 value);
+
+string entity.get_string(component_type type, string property, string default_value);
+void   entity.set_string(component_type type, string property, string value);
+
+bool   entity.get_bool(component_type type, string property, bool default_value);
+void   entity.set_bool(component_type type, string property, bool value);
+```
+
+Getters return `default_value` if the entity has no component of that type, or the component doesn't recognize the property name. Setters are a no-op in the same case.
+
+Known property names used internally by the engine's own convenience setters (there may be more per component — check the relevant `*_component.cpp`'s `get_/set_*_property` overrides for the authoritative list):
+
+| Component | Property | Type |
+|---|---|---|
+| `static_mesh` | `mesh_asset_id` | string |
+| `static_mesh` / `skeletal_mesh` (also reachable as `material`) | `material_asset_id` | string — legacy one-material view, see [Materials](#materials) |
+| `skybox` | `skybox_asset_id` | string |
+| `skybox` | `reflection_intensity` | float — how strongly materials reflect the sky (0 = off) |
+| `skeletal_mesh` | `playback_speed` | float |
+| `sound` | `sound_asset_id` | string |
+| `sound` | `volume`, `pitch`, `min_distance`, `max_distance` | float |
+| `sound` | `loop`, `play_on_start`, `is_3d` | bool |
+| `point_light` / `spot_light` / `directional_light` | `intensity` | float |
+| `point_light` / `spot_light` / `directional_light` | `color` | vec3 |
+| `point_light` / `spot_light` / `directional_light` | `radius` | float |
+| `camera` | `fov` | float |
+| `camera` | `is_primary` | bool |
+| `fog` | `color` | vec3 |
+| `fog` | `density` | float |
+| `fog` | `start` | float |
+| `post_process` | `bloom_enabled` | bool |
+| `post_process` | `bloom_threshold` | float |
+| `post_process` | `bloom_intensity` | float |
+| `post_process` | `dof_enabled` | bool |
+| `post_process` | `dof_focus_distance` | float |
+| `post_process` | `dof_focus_range` | float |
+| `rigidbody` | `mass` | float |
+| `character_controller` | `radius`, `height`, `step_offset`, `slope_limit_degrees` | float |
+| `character_controller` | `vertical_velocity` | float (read/write - the controller's current up/down speed; writing it while airborne is how the FPS sample double-jumps and how explosions toss the player) |
+| `character_controller` | `is_grounded`, `use_gravity` | bool (`is_grounded` is read-only) |
+
+Example — reading a property that has no dedicated wrapper:
+
+```cpp
+float bloom_threshold = self().get_float(component_type::post_process, "bloom_threshold", 1.0f);
+```
+
+## Global functions
+
+Free functions, called without an object (e.g. `log_info("...")`, not `entity.log_info(...)`).
+
+### Logging
+
+```cpp
+void print(string message, int level);
+void log_info(string message);
+void log_warning(string message);
+void log_error(string message);
+```
+
+| Member | Description |
+|---|---|
+| `print(message, level)` | Writes to stdout if `level == 0`, otherwise to stderr |
+| `log_info` | `print(message, 0)` |
+| `log_warning` | `print("[warning] " + message, 1)` |
+| `log_error` | `print("[error] " + message, 1)` |
+
+### Entity lookup
+
+```cpp
+entity@ self();
+entity@ find_entity(string guid);
+entity@ find_entity_by_name(string name);
+entity@ find_primary_camera();
+int     get_entity_count();
+entity@ get_entity_by_index(int index);
+
+entity@ find_entity_by_tag(string tag);
+int     count_entities_by_tag(string tag);
+entity@ find_closest_entity_by_tag(string tag, vec3 position, float max_distance);
+```
+
+| Member | Description |
+|---|---|
+| `self()` | The entity that owns the currently running script |
+| `find_entity(guid)` | Looks up by `get_guid()`. Returns `null` if not found |
+| `find_entity_by_name(name)` | Looks up by `get_name()`, first match. Returns `null` if not found. **O(n)** over all entities in the scene |
+| `find_primary_camera()` | First entity in the scene with a camera component whose `is_primary` property is `true`. Returns `null` if none is marked primary |
+| `get_entity_count()` / `get_entity_by_index(i)` | Enumerate every entity in the current scene; `get_entity_by_index` returns `null` for an out-of-range index |
+| `find_entity_by_tag(tag)` | First entity carrying the tag (see [tags](#identity-naming-and-tags)), or `null` |
+| `count_entities_by_tag(tag)` | How many entities carry the tag — a spawner's "how many enemies are alive" |
+| `find_closest_entity_by_tag(tag, position, max_distance)` | Nearest tagged entity (by world position) within `max_distance`, or `null` |
+
+All lookups skip entities already queued for deletion by `destroy()` this frame.
+
+### Entity spawning
+
+```cpp
+entity@ spawn_entity(string name);
+entity@ spawn_entity_at(string name, vec3 position);
+entity@ clone_entity(entity@ source, string new_name);
+entity@ spawn_prefab(string prefab_reference, vec3 world_position);
+```
+
+| Member | Description |
+|---|---|
+| `spawn_entity(name)` | Creates a new, empty entity in the current scene at the origin |
+| `spawn_entity_at(name, position)` | Same, then sets its position |
+| `clone_entity(source, new_name)` | Deep-copies `source` (equivalent to `source.clone(new_name)`) |
+| `spawn_prefab(reference, world_position)` | Instantiates a `.wprefab` (see the Prefabs guide) as a new root entity at a world position. `reference` is relative to the project's `Game` folder, e.g. `"Prefabs/Enemy.wprefab"`. Returns `null` (and logs a warning) when the file isn't found |
+
+**Remarks**
+
+A spawned prefab is complete immediately — components, children, tags, and its behaviours, which `spawn_prefab` builds before returning (constructor plus field values, so you can set their fields right away; see [Other behaviours' fields](#other-behaviours-fields)). Their `Start` and first `Update` run on the *next* script update, and the colliders reach the physics scene on the next physics step. Bullet impacts, muzzle flashes, dropped pickups and enemies in the FPS sample are all `spawn_prefab` calls; a prefab that should clean itself up carries a script that calls `self().destroy()` after a while.
+
+### Levels
+
+```cpp
+void   load_level(string level_reference);
+string get_level_path();
+```
+
+| Member | Description |
+|---|---|
+| `load_level(reference)` | Asks the host to replace the scene with another level. `reference` is resolved like a prefab reference: relative to the project's `Game` folder (`"Levels/e2_foundry.wmap"`) or absolute. The switch is **deferred** to the end of this frame's script update, after every script has run, so the calling script keeps executing normally and nothing it holds is destroyed under it. The last request in a frame wins; an unknown level is reported and ignored |
+| `get_level_path()` | Reference of the level the scene was loaded from, in the same `Game`-relative form (empty for a scene built by hand). `load_level(get_level_path())` restarts the current level |
+
+**Remarks**
+
+Every entity - the player, the UIs it created, the caller itself - is destroyed by the switch, and the new level's behaviours start from their `Start`. State that should survive goes through the [save data](#save-data), which is *not* cleared by a level change: write it before calling `load_level`, read it in the next level's `Start`. `set_mouse_hidden` and the input mode are reset too; re-apply them in the new level.
+
+In the editor, `load_level` while playing swaps the play-mode scene only. Stop restores the level that was open before Play, so Save still writes that level.
+
+### Messaging between scripts
+
+Scripts on different entities talk through named messages. The sender calls:
+
+```cpp
+bool send_message(entity@ target, string name, float value);
+int  broadcast_message(string name, float value);
+```
+
+and the receiving behaviour implements either of:
+
+```cpp
+void OnMessage(string name, float value, entity@ sender);
+void OnMessage(string name, float value);
+```
+
+| Member | Description |
+|---|---|
+| `send_message(target, name, value)` | Calls `OnMessage` on every script component of `target`, right now, and returns `true` if at least one of them has a handler. Returns `false` for an entity without a script, one whose script failed to compile, or one queued for deletion. An entity spawned this frame already has its behaviours, so it receives the message - its `Start` runs first |
+| `broadcast_message(name, value)` | Sends to every scripted entity in the scene except the caller; returns how many handled it |
+
+**Remarks**
+
+- Delivery is synchronous: `OnMessage` runs before `send_message` returns, on its own script context, so a script can message itself and chains (A → B → A) are fine. `self()`, input, time and the UI functions all work inside a handler.
+- `sender` is the entity whose script called `send_message` (the binder entity inside a widget callback).
+- A receiver that hasn't run yet gets its `Start` first, so handlers never see an uninitialised behaviour.
+- The payload is one `float`; anything richer belongs in the sender's or receiver's public fields ([Other behaviours' fields](#other-behaviours-fields)) - the receiver gets the sender as a handle to read them from.
+
+The FPS sample uses these messages: `"damage"` (value = amount), `"health"` and `"ammo"` (pickups → player), `"enemy_killed"` (enemy → player), `"player_respawned"` (player → everyone).
+
+```cpp
+// enemy.wscript
+class enemy
+{
+    float health = 100.0f;     // this enemy's starting health, set in the inspector
+
+    void Update(float delta_time) { /* ... */ }
+
+    void OnMessage(string name, float value, entity@ sender)
+    {
+        if (name == "damage")
+        {
+            health -= value;
+            if (health <= 0.0f)
+            {
+                send_message(sender, "enemy_killed", 1.0f);
+                self().destroy();          // deferred - safe from inside a handler
+            }
+        }
+    }
+}
+```
+
+### Input
+
+```cpp
+bool is_key_down(key key_code);
+bool is_key_pressed(key key_code);
+bool is_key_released(key key_code);
+
+bool is_mouse_button_down(mouse_button button);
+bool is_mouse_button_pressed(mouse_button button);
+bool is_mouse_button_released(mouse_button button);
+
+vec2 get_mouse_position();
+vec2 get_mouse_delta();
+vec2 get_scroll_delta();
+
+void set_mouse_hidden(bool hidden);
+```
+
+| Member | Description |
+|---|---|
+| `is_*_down` | `true` every frame the key/button is held |
+| `is_*_pressed` | `true` only on the frame it transitioned to down |
+| `is_*_released` | `true` only on the frame it transitioned to up |
+| `get_mouse_position()` | Cursor position in viewport pixels (the same space UI widgets are laid out in). In the editor this is relative to the Viewport panel, not the window |
+| `get_mouse_delta()` | Movement since the previous frame |
+| `get_scroll_delta()` | Scroll wheel movement since the previous frame |
+| `set_mouse_hidden(hidden)` | Asks for the cursor to be hidden and captured for relative mouse-look. Only honoured while the input mode is `game_only` — see remarks |
+
+**Remarks**
+
+Everything above is *filtered by the current input mode* (see [UI and widgets](#ui-and-widgets)). In `game_and_ui` mode a click that lands on a hit-testable widget is never reported to scripts (`is_mouse_button_pressed` stays `false`, and the button stays "not down" for as long as the widget holds it), and the scroll wheel is masked while the pointer is over UI. In `ui_only` mode every key, button, scroll and mouse-motion query returns `false`/zero. In `game_only` mode nothing is filtered.
+
+<Warning>
+
+`set_mouse_hidden(true)` both hides the OS cursor **and** enables relative/captured mouse-look (it is backed by the same platform call used for hide+capture, `GLFW_CURSOR_DISABLED`). There is currently no way to hide just the cursor icon while keeping normal absolute mouse input — calling this always grabs the mouse for look-around input, matching the pattern used in the [third-person controller example](#complete-examples).
+
+The request is remembered rather than applied immediately: the engine pushes the effective cursor state to the window once per frame, only when it changes, and only while the input mode is `game_only`. Switching to `game_and_ui`/`ui_only` frees the cursor regardless; switching back to `game_only` re-applies whatever `set_mouse_hidden` last asked for. Calling it every frame is therefore harmless (and no longer costs a platform call per frame).
+
+</Warning>
+
+### UI and widgets
+
+Runtime UI is a **GUI component** on an entity that references a `.wgui` layout asset authored in the editor's GUI Designer. The widget model follows Unreal's UMG: canvas panels with anchors, horizontal / vertical boxes, text, images, buttons, progress bars, check boxes and sliders, each with a visibility, a render transform and a z-order. **The UI reference covers this in full** - widget kinds, layout rules, the designer, the complete widget API and the auto-binding described below. This section is the short version.
+
+```cpp
+entity@ CreateUI(string layout);          // "UI/PlayerHud" (path without extension) or an asset id; shows it
+void    ShowUI(entity@ ui);   void HideUI(entity@ ui);   bool IsUIVisible(entity@ ui);
+void    DestroyUI(entity@ ui);   bool IsAnyUIShown();
+int     BindWidgets(entity@ ui);          // bind the calling behaviour's widget fields and On*_ handlers
+
+Widget@ FindWidget(entity@ ui, string name);   // plus FindText / FindImage / FindButton / FindProgressBar / FindCheckBox / FindSlider
+bool SetWidgetText(entity@ ui, string name, string text);        // one-liners, false when there is no such widget
+bool SetWidgetVisible(entity@ ui, string name, bool visible);
+bool SetWidgetPercent(entity@ ui, string name, float percent);
+bool SetWidgetColor(entity@ ui, string name, vec4 color);
+```
+
+**Auto-binding.** A behaviour that calls `CreateUI` gets its widget handle fields (`TextWidget@ Health;`) filled by widget name, and its `OnClicked_<Widget>()`, `OnPressed_`, `OnReleased_`, `OnHovered_`, `OnUnhovered_`, `OnCheckStateChanged_<Widget>(bool)` and `OnValueChanged_<Widget>(float)` methods bound as handlers - no `FindWidget` / `cast` / `BindOnClicked` lines needed. `BindWidgets(ui)` does the same for a UI the behaviour did not create. Names match exactly first, then ignoring case, `_`, `-` and spaces.
+
+Every widget kind has `SetVisible`, `SetVisibility`, `SetEnabled`, `SetPosition` / `SetOffset`, `SetSize`, `SetAnchors`, `SetAlignment`, `SetZOrder`, `SetColor` / `SetTint`, `SetTexture`, `SetOpacity`, the render transform setters, `GetScreenPosition` / `GetScreenSize`, `GetParent` / `GetChild`, `IsHovered` / `IsPressed`; `TextWidget` adds `SetText`, `SetFontSize`, `SetJustification`, `SetWordWrap`, `SetShadow`; `ButtonWidget` the `BindOn*` family and custom colours; `ProgressBarWidget` `SetPercent`; `CheckBoxWidget` `SetChecked` / `IsChecked`; `SliderWidget` `SetValue` / `SetRange` / `SetStep`. Changes affect that UI instance only - the `.wgui` on disk is never touched.
+
+#### Input modes
+
+The engine keeps one explicit record of **who is processing input**: the current *input mode*, the UI entity that has focus, and — refreshed every frame — which widget the pointer is over and whether a widget is holding a press. Scripts read and change it with:
+
+```cpp
+enum input_mode { game_only, game_and_ui, ui_only }
+
+void       SetInputModeGameOnly();
+void       SetInputModeGameAndUI(entity@ ui_to_focus);
+void       SetInputModeUIOnly(entity@ ui_to_focus);
+input_mode GetInputMode();
+
+entity@    GetFocusedUI();
+void       SetFocusedUI(entity@ ui);
+bool       IsPointerOverUI();
+Widget@    GetHoveredWidget();
+```
+
+| Mode | Cursor | UI | Scripts |
+|---|---|---|---|
+| `game_only` (default) | as requested by `set_mouse_hidden` | drawn, never hit-tested | see raw input |
+| `game_and_ui` | free | every shown UI is hit-tested; buttons work | see everything the UI did not consume |
+| `ui_only` | free | as above | see nothing (keys, buttons, scroll and mouse motion all read as idle) |
+
+Mode is global for the running game, not per UI: in the two UI modes *every* shown GUI component is hit-tested, topmost first (later entities and later widgets draw on top). The `ui_to_focus` argument is what `GetFocusedUI()` returns afterwards; it is tracked by entity id, so destroying that entity simply clears the focus.
+
+A button fires `on_clicked` on **release inside** the button that was pressed, like every desktop UI: press on it, drag off, release elsewhere = no click. While a button is held it "captures" the pointer, so gameplay sees neither the press nor the release. Buttons tint themselves lighter while hovered and darker while pressed, and half-transparent when disabled.
+
+Only widgets marked **Blocks Input** in the GUI Editor (`hit_test` in the `.wgui`) take part in hit-testing. Buttons default to on, everything else to off, so a HUD label never swallows a gameplay click while a menu panel does. `IsPointerOverUI()` reports exactly this: the pointer is over a blocking widget, or a button is holding a press.
+
+The `on_clicked` callback runs with the full script API available: `self()` is the entity whose script called `BindOnClicked`, and `find_entity`, `HideUI`, `DestroyUI`, `SetInputModeGameOnly`, `is_key_down` and friends all work inside it.
+
+Example — a pause menu that hands input to the UI and back:
+
+```cpp
+class pause_menu
+{
+    string menu_asset = "UI/PauseMenu";   // set per entity in the Properties panel
+
+    private entity@ m_menu;
+
+    void Start() {
+        @m_menu = CreateUI(menu_asset);
+        HideUI(m_menu);
+
+        ButtonWidget@ resume = cast<ButtonWidget@>(FindWidget(m_menu, "Resume"));
+        if (resume !is null) resume.BindOnClicked("OnResume");   // a method of this class
+    }
+
+    void Update(float dt) {
+        if (is_key_pressed(key::escape)) {
+            if (GetInputMode() == input_mode::game_only) {
+                ShowUI(m_menu);
+                SetInputModeUIOnly(m_menu);   // cursor appears, gameplay input stops
+            } else {
+                OnResume();
+            }
+        }
+
+        // In game_and_ui mode this would be skipped automatically while the
+        // pointer is over a blocking widget; in ui_only it is always false.
+        if (is_mouse_button_pressed(mouse_button::left))
+            fire();
+    }
+
+    void OnResume() {
+        HideUI(m_menu);
+        SetInputModeGameOnly();               // set_mouse_hidden(true) takes effect again
+    }
+}
+```
+
+### Time
+
+```cpp
+float get_time();
+float get_delta_time();
+```
+
+| Member | Description |
+|---|---|
+| `get_time()` | Total elapsed time, in seconds, since the scene started running |
+| `get_delta_time()` | The current frame's delta time, in seconds — the same value passed into `Update(float)` |
+
+### Math library
+
+Global functions mirroring `<cmath>`, plus small engine-specific helpers. Trig functions operate on **radians**; use `radians()`/`degrees()` to convert to/from the degree values used by transforms.
+
+| Function | Description |
+|---|---|
+| `float sin(float)` / `cos(float)` / `tan(float)` | Standard trig |
+| `float asin(float)` / `acos(float)` / `atan(float)` | Inverse trig |
+| `float atan2(float y, float x)` | Two-argument arctangent |
+| `float sqrt(float)` | Square root |
+| `float pow(float base, float exponent)` | Exponentiation |
+| `float floor(float)` / `ceil(float)` / `round(float)` | Rounding |
+| `float abs(float)` / `int abs(int)` | Absolute value (overloaded) |
+| `float min(float, float)` / `int min(int, int)` | Minimum (overloaded) |
+| `float max(float, float)` / `int max(int, int)` | Maximum (overloaded) |
+| `float clamp(float v, float lo, float hi)` / `int clamp(int v, int lo, int hi)` | Clamp to range (overloaded) |
+| `float lerp(float a, float b, float t)` | Linear interpolation, `a + (b - a) * t` |
+| `float radians(float degrees)` | Degrees → radians |
+| `float degrees(float radians)` | Radians → degrees |
+| `float random_float(float min, float max)` | Uniform random float in `[min, max]` |
+| `int random_int(int min, int max)` | Uniform random int in `[min, max]` |
+| `float distance(vec2 a, vec2 b)` | `(a - b).length()` |
+| `float distance(vec3 a, vec3 b)` | `(a - b).length()` |
+
+### Strings
+
+```cpp
+string to_string(int value);
+string to_string(float value);            // two decimals
+string to_string(float value, int decimals);
+string to_string(bool value);
+```
+
+The `string` type only concatenates with other strings, so numbers go through `to_string` first: `ammo_text.SetText(to_string(ammo_in_mag) + " / " + to_string(reserve_ammo));`.
+
+### Save data
+
+A small key/value persistence layer. Values live in a single in-memory store shared by every script in the running game — set them from any entity's script and read them back from any other, then write the whole store out to a named slot file when you actually want it on disk. The store survives `load_level`, which is how a player carries its inventory from one level to the next (see the FPS guide).
+
+```cpp
+void   save_set_int(string key, int value);
+int    save_get_int(string key, int default_value);
+
+void   save_set_float(string key, float value);
+float  save_get_float(string key, float default_value);
+
+void   save_set_string(string key, string value);
+string save_get_string(string key, string default_value);
+
+void   save_set_bool(string key, bool value);
+bool   save_get_bool(string key, bool default_value);
+
+void   save_set_vec3(string key, vec3 value);
+vec3   save_get_vec3(string key, vec3 default_value);
+
+void   save_clear();
+
+bool   save_write_file(string slot_name);
+bool   save_read_file(string slot_name);
+bool   save_file_exists(string slot_name);
+bool   save_delete_file(string slot_name);
+```
+
+| Member | Description |
+|---|---|
+| `save_set_*` / `save_get_*` | Write/read a named value in the in-memory store. Keys match exactly. Getters return `default_value` if the key was never set (or its value doesn't parse as the requested type) |
+| `save_clear()` | Empties the in-memory store. Does not touch any file on disk |
+| `save_write_file(slot_name)` | Writes the entire in-memory store to `<game_dir>/Saves/<slot_name>.zer`, creating the `Saves` folder if needed. Always overwrites. Returns `false` only if the folder couldn't be created |
+| `save_read_file(slot_name)` | Replaces the in-memory store with the contents of that slot file. Returns `false` (leaving in-memory data untouched) if the slot doesn't exist |
+| `save_file_exists(slot_name)` | Checks for the slot file without loading it |
+| `save_delete_file(slot_name)` | Deletes the slot file. Returns `false` if it didn't exist |
+
+`slot_name` is just a save's identifier, e.g. `"slot1"` or `"autosave"` — don't include a path or extension, and don't use it for player-facing text: only the filename portion is ever used (so a value like `"../../whatever"` still resolves inside `Saves/`), and `.zer` is appended automatically if missing.
+
+Example — a simple checkpoint system:
+
+```cpp
+void save_checkpoint() {
+    save_set_vec3("player_pos", self().get_position());
+    save_set_int("level_index", current_level);
+    save_set_float("play_time", get_time());
+    save_write_file("slot1");
+}
+
+void load_checkpoint() {
+    if (!save_read_file("slot1")) {
+        log_warning("no save in slot1");
+        return;
+    }
+
+    vec3 pos = save_get_vec3("player_pos", vec3(0.0f, 0.0f, 0.0f));
+    self().set_position(pos.x, pos.y, pos.z);
+    current_level = save_get_int("level_index", 0);
+}
+```
+
+**Remarks**
+
+The slot file is a ZER document (`vendor/ZER/ZER/ZER.h`) with one block per key, so keys that contain each other (`"weapon"` / `"weapons"`, `"level"` / `"level_index"`) are safe:
+
+```text
+SaveData{
+	level{
+		value:Levels/e2_foundry.wmap;
+	}
+	weapons{
+		value:3;
+	}
+}
+```
+
+Values are stored as text (`%.9g` for floats, `x,y,z` for a `vec3`, `1`/`0` for a bool), which is why a getter of the wrong type falls back to its default rather than reinterpreting bits.
+
+## Complete examples
+
+Two real scripts from a project built on this engine, included in full because they exercise most of the API together — transform, hierarchy, physics, input, and the camera yaw/pitch quirk — and demonstrate the recommended patterns for each.
+
+### Third-person character controller
+
+WASD moves relative to the camera; the character turns to face its movement direction; the mouse orbits a detached camera around the player. The player root has a **character controller**; the camera is a child in the prefab (a `.wprefab` can only have one root) and is detached at run time so it doesn't inherit the character's rotation. This is `test_script.wscript` in the Test project.
+
+```cpp
+entity@ find_child(entity@ parent, const string &in name) {
+    if (parent is null) return null;
+    for (int i = 0; i < parent.get_child_count(); ++i) {
+        entity@ child = parent.get_child(i);
+        if (child is null) continue;
+        if (child.get_name() == name) return child;
+        entity@ nested = find_child(child, name);
+        if (nested !is null) return nested;
+    }
+    return null;
+}
+
+class test_script
+{
+    // Inspector fields: tune the feel per character in the Properties panel.
+    float move_speed = 10.0f;
+    float sprint_multiplier = 2.0f;
+    float turn_speed = 10.0f;
+    float mouse_sensitivity = 0.15f;
+    float cam_distance = 9.0f;
+    float cam_height = 3.0f;
+    float cam_pitch_min = -75.0f;
+    float cam_pitch_max = 35.0f;
+
+    // The behaviour's own state.
+    private entity@ camera;
+    private entity@ TPmesh;
+
+    private float cam_yaw = 0.0f;
+    private float cam_pitch = 15.0f;
+    private float player_yaw = 0.0f;
+
+    void Start() {
+        @camera = find_child(self(), "Camera");
+        @TPmesh = find_child(self(), "TPmesh");
+
+        // An orbit camera must not inherit the character's rotation - detach it.
+        if (camera !is null) camera.set_parent(null);
+
+        player_yaw = self().get_rotation().y;
+    }
+
+    void Update(float delta_time) {
+        vec2 mouse_delta = get_mouse_delta();
+        // Forward is -Z: mouse right (+x) turns the view right, which is a
+        // decreasing yaw; mouse up (-y) looks up, which is a positive pitch.
+        cam_yaw -= mouse_delta.x * mouse_sensitivity;
+        cam_pitch -= mouse_delta.y * mouse_sensitivity;
+        cam_pitch = clamp(cam_pitch, cam_pitch_min, cam_pitch_max);
+
+        // Yaw about world Y, then pitch about the camera's own X axis. A plain
+        // set_rotation(pitch, yaw, 0) would roll the view - see Transform.
+        if (camera !is null) camera.set_look_rotation(cam_pitch, cam_yaw);
+
+        set_mouse_hidden(true);
+
+        float forward_input = 0.0f;
+        float strafe_input = 0.0f;
+        if (is_key_down(key::w)) forward_input += 1.0f;
+        if (is_key_down(key::s)) forward_input -= 1.0f;
+        if (is_key_down(key::d)) strafe_input += 1.0f;
+        if (is_key_down(key::a)) strafe_input -= 1.0f;
+
+        bool moving = forward_input != 0.0f || strafe_input != 0.0f;
+        bool sprinting = moving && is_key_down(key::left_shift);
+
+        if (TPmesh !is null) {
+            if (sprinting) TPmesh.blend_to_animation("Running", 0.2f, true);
+            else if (moving) TPmesh.blend_to_animation("Walking", 0.2f, true);
+            else TPmesh.blend_to_animation("Idle", 0.2f, true);
+        }
+
+        float target_vx = 0.0f;
+        float target_vz = 0.0f;
+
+        if (camera !is null && moving) {
+            // get_forward()/get_right() are the camera's true world-space axes.
+            vec3 cam_fwd_raw = camera.get_forward();
+            vec3 cam_right_raw = camera.get_right();
+            vec3 cam_fwd = vec3(cam_fwd_raw.x, 0.0f, cam_fwd_raw.z).normalized();
+            vec3 cam_right = vec3(cam_right_raw.x, 0.0f, cam_right_raw.z).normalized();
+
+            vec3 move_dir = (cam_fwd * forward_input + cam_right * strafe_input).normalized();
+
+            float speed = sprinting ? move_speed * sprint_multiplier : move_speed;
+            target_vx = move_dir.x * speed;
+            target_vz = move_dir.z * speed;
+
+            // The Mixamo mesh is modelled facing +Z, so yaw = atan2(x, z) turns
+            // its face toward the movement direction.
+            float target_yaw = degrees(atan2(move_dir.x, move_dir.z));
+
+            float yaw_diff = target_yaw - player_yaw;
+            while (yaw_diff > 180.0f) yaw_diff -= 360.0f;
+            while (yaw_diff < -180.0f) yaw_diff += 360.0f;
+
+            player_yaw += yaw_diff * min(1.0f, turn_speed * delta_time);
+
+            vec3 current_rot = self().get_rotation();
+            self().set_rotation(current_rot.x, player_yaw, current_rot.z);
+        }
+
+        self().move_character(target_vx, target_vz);
+
+        if (camera !is null) {
+            vec3 look_target = self().get_world_position() + vec3(0.0f, cam_height, 0.0f);
+            vec3 cam_pos = look_target - camera.get_forward() * cam_distance;
+            camera.set_position(cam_pos.x, cam_pos.y, cam_pos.z);
+        }
+    }
+}
+```
+
+### First-person shooter
+
+The complete first-person campaign — player rig with head pitch and a weapon parented under the camera, four weapon classes found along the way (hitscan `raycast` shooting and a rocket launcher), dash and double jump, grenades, damage over `send_message`, melee, ranged, charging and boss enemies, rooms that lock down and spawn their enemies when entered, key doors, teleporters that carry the player's state to the next level through the save data, dynamic music layers, pickups and a HUD — is documented in the FPS guide; the scripts are `fps_player`, `fps_enemy`, `fps_shooter`, `fps_brute`, `fps_boss`, `fps_projectile`, `fps_rocket`, `fps_explosion`, `fps_explosive`, `fps_grenade`, `fps_area`, `fps_door`, `fps_teleporter`, `fps_music`, `fps_pickup`, `fps_despawn`, the data components `fps_level`, `fps_spawn_point` and `fps_music_layer` and, for the older arena level, `fps_wave_director`, `fps_target` and `fps_spawner` (`.wscript`) in the Test project's `Game/Scripts` folder.
+
+### Flashlight toggle
+
+A minimal example of input handling and toggling component visibility — attach to an entity that has a `spot_light` component.
+
+```cpp
+class flashlight
+{
+    // Starts on unless this entity's field says otherwise.
+    bool start_on = true;
+
+    private bool m_is_on = true;
+
+    void Start() {
+        m_is_on = start_on;
+        self().set_component_visible(component_type::spot_light, m_is_on);
+    }
+
+    void Update(float delta_time) {
+        if (is_key_pressed(key::f)) {
+            m_is_on = !m_is_on;
+            self().set_component_visible(component_type::spot_light, m_is_on);
+        }
+    }
+}
+```
+
+## Known limitations and quirks
+
+A consolidated list of every non-obvious behavior called out in this document, for quick reference:
+
+- **Rotation order is X-outermost.** Euler angles compose as `Rx * Ry * Rz`, so `set_rotation(pitch, yaw, 0)` tilts about the *world* X axis and rolls the view once yaw is non-zero. Use `set_look_rotation(pitch, yaw)` for anything that aims, or split yaw and pitch across a parent/child pair. See [Transform](#transform).
+- **Forward is -Z for everything** — cameras, spot/directional lights, `get_forward()`. A mesh modelled facing +Z (Mixamo characters) shows its back along `get_forward()`; rotate the mesh child 180° about Y inside its prefab. See [World transform and direction vectors](#world-transform-and-direction-vectors).
+- **`destroy()` is deferred** to the end of the frame's script update. Handles stay valid until then; lookups and `send_message` already skip queued entities. See [Identity, naming, and tags](#identity-naming-and-tags).
+- **A spawned prefab's behaviours exist as soon as `spawn_prefab` returns, but `Start` runs next frame**, and its colliders enter the physics scene on the next physics step. Set its fields right after spawning; anything its `Start` computes from them isn't there yet. See [Entity spawning](#entity-spawning).
+- **`send_message` carries one `float`.** Richer data belongs on the entity (component properties, the receiver's own fields); the receiver gets the sender as a handle. See [Messaging between scripts](#messaging-between-scripts).
+- **Raycasts only see physics shapes** (colliders and character controllers), never bare static meshes; trigger shapes never block. See [Raycasts](#raycasts).
+- **A character controller overwrites `set_position` every physics step** — teleport it with `set_character_position`. See [Physics](#physics).
+- **A `.wprefab` can only save one root entity.** Anything else must be a nested child, even if it logically shouldn't inherit the root's transform — detach it at run time with `set_parent(null)` instead. See [Hierarchy](#hierarchy-parenting).
+- **Prefab instances are rebuilt from their file on every level load**, and the entities inside them get fresh ids each time — find them by name, not by id. Only an instance root's name, position, rotation, tags, script field values and any scale axis changed on the instance belong to the level; everything else — its scale included — comes from the prefab. See the Prefabs guide.
+- **`load_level` is deferred** to the end of the frame's script update, and destroys every entity including the caller. Carry state across it in the save data. See [Levels](#levels).
+- **`entity.add_component()` can't create every `component_type`.** Only `static_mesh`, `sound`, `point_light`, `spot_light`, `directional_light`, `camera`, `skybox`, `fog`, `post_process`, and `skeletal_mesh` are runtime-creatable; `material` (there is no such component any more — materials live on the mesh component), `scripting`, `rigidbody`, the collider types, and `sprite` always return `false`. See [Component management](#component-management).
+- **Only a Dynamic rigidbody responds to forces/velocity.** Kinematic and Static bodies make every physics function in this API a no-op; move a Kinematic body with `set_position`/`set_rotation` instead. See [Physics](#physics).
+- **A Dynamic body's transform is owned by physics after simulation** — direct `set_position`/`set_rotation` calls are overwritten next frame, *unless* the corresponding axis is locked (Freeze Rotation), in which case that one axis is left untouched by the simulation and safe to write directly. See [Physics](#physics).
+- **Reading a Dynamic body's `get_rotation().y` back as a continuous yaw signal is unreliable past ±90° of turn** (the underlying Euler decomposition aliases beyond that range). Track intended yaw as a script-side variable instead of reading it back — see the [third-person controller example](#complete-examples).
+- **`set_mouse_hidden(true)` also captures/grabs the mouse** for relative look input — there's no way to hide just the cursor icon while keeping normal absolute mouse movement. It is only honoured in `game_only` input mode. See [Input](#input).
+- **Input is filtered by the input mode.** A click a widget consumed never reaches `is_mouse_button_pressed`; in `ui_only` mode every input query reads idle. Check `GetInputMode()`/`IsPointerOverUI()` rather than guessing. See [UI and widgets](#ui-and-widgets).
+- **Only widgets marked "Blocks Input" are hit-tested.** A panel or image that should block clicks to the world behind it needs the flag on; buttons have it on by default. See [UI and widgets](#ui-and-widgets).
+- **`HideUI` sticks.** A GUI component's *auto show* only fires once, when the component is first updated, so hiding a UI is not undone next frame.
+- **Entity handles (`entity@`) aren't reference-counted.** Destroying an entity elsewhere leaves any handle your script was holding dangling. See [Language notes](#language-notes).
+- **No root-motion extraction.** A playing animation clip never moves the entity — drive position/velocity yourself. See [Animation](#animation).
+- **Each entity gets its own class instance** (and its own module), so members — and the script globals of a class-less script — are per-entity state, never shared between two entities running the same `.wscript`. See [Overview](#overview).
+- **Only field values that differ from the script's own initialiser are stored.** Change a default in the `.wscript` and every entity that never overrode that field follows it; that is deliberate, but it does mean a value you set to exactly the default is not recorded. See [Behaviour classes and inspector fields](#behaviour-classes-and-inspector-fields).
+- **An `entity@` field is stored by entity id.** Ids inside a prefab instance are regenerated on every load, so reference a level entity or an instance root, never content nested inside an instance.
+- **The editor compiles and constructs a script to read its defaults**, so a behaviour's constructor runs in the editor as soon as the component shows it. Keep constructors to initialising members; do the work in `Start()`.
+- **No `#include`.** Each `.wscript` is compiled as a single, self-contained file.
+- **A script that fails to compile is reported once and left alone** until its asset changes or the level is reloaded; it is not retried every frame.
+- **`key` is the name of the input enum**, so a script global or local named `key` is a compile error ("Name conflict. 'key' is an extended data type"). The same goes for the other registered type names (`entity`, `vec3`, `mouse_button`, `component_type`, `input_mode`, the widget types).
