@@ -1,33 +1,67 @@
 ---
-title: "Introduction"
-description: "A 3D game engine for Windows with forward clustered rendering and a flexible ECS"
+title: "Quickstart"
+description: "Create your first WizardMachine script and run it on an entity."
 ---
 
-WizardMachine is a fully 3D game engine for Windows, built around forward clustered rendering and a custom entity component system (ECS). It's for developers who want to build 3D games in C++ with rendering, animation, AI, and UI in one engine.
+This quickstart walks you through creating a script, attaching it to an entity, and running it in Play mode.
 
-## What's included
+## Prerequisites
 
-- **Forward clustered rendering** with a full post-processing pipeline
-- **Custom ECS architecture** that lets you attach a component of any class to any entity
-- **C++ scripting** for gameplay logic
-- **Asset management** for your project's content
-- **Skeletal animation** with full support for animated characters
-- **Behavior-tree AI** for driving non-player characters
-- **Built-in UI system** with text rendering
-- **Native Windows support**
+Before you begin, make sure you have:
 
-## Get started
+- **WizardMachine** installed from the [Microsoft Store](https://apps.microsoft.com/detail/9nvdpg63kq7n).
+- A code editor. This guide uses **Visual Studio Code**.
+- The **WIZMEXT** VS Code extension, for syntax highlighting and code completion.
 
-<CardGroup cols={2}>
-  <Card title="Quickstart" icon="rocket" href="/quickstart">
-    Install WizardMachine and get your first scene running.
-  </Card>
+## Create and run your first script
 
-  <Card title="Scripting reference" icon="code" href="/scripting">
-    Drive entities at run time with AngelScript behaviour classes.
-  </Card>
+<Steps>
+  <Step title="Create a script">
+    In the **Content Browser**, select **\+ Add > New Script** and name it `hello`. WizardMachine creates a `hello.wscript` file containing a behaviour class named after the file, with empty `Start` and `Update` methods.
+  </Step>
+  <Step title="Open the script">
+    Open `hello.wscript` in Visual Studio Code.
+  </Step>
+  <Step title="Write your behaviour">
+    Replace the contents with the following and save the file:
 
-  <Card title="Download" icon="download" href="https://apps.microsoft.com/detail/9nvdpg63kq7n">
-    Get WizardMachine free from the Microsoft Store.
-  </Card>
-</CardGroup>
+    ```cpp
+        // hello.wscript
+    
+        class hello
+        {
+            string greeting = "Hello";
+    
+            void Start() {
+                log_info(greeting + " from " + self().get_name());
+            }
+    
+            void Update(float delta_time) {
+                // Spin the entity 45 degrees per second around its Y axis.
+                self().add_rotation(0.0f, 45.0f * delta_time, 0.0f);
+            }
+        }
+    ```
+
+    `Start` runs once before the first update, and `Update` runs every frame.
+  </Step>
+  <Step title="Add a Scripting component">
+    Select the entity you want to drive, then add a **Scripting** component from the **Add Component** menu.
+  </Step>
+  <Step title="Assign the script">
+    Assign `hello` to the Scripting component. The class's public fields, such as `greeting`, appear underneath it, where you can change them for this entity.
+  </Step>
+  <Step title="Enter Play mode">
+    Start the game. The entity spins, and the greeting is written to the log. Press **Stop** or `Escape` to end the session and restore the level to its pre-play state.
+  </Step>
+</Steps>
+
+## Next steps
+
+<Card title="Scripting reference" icon="code" href="/scripting">
+  Explore the full entity API, input, physics, UI, and save data.
+</Card>
+
+<Tip>
+  Need help? Reach out at [sebastianrautenbachwork@gmail.com](mailto:sebastianrautenbachwork@gmail.com).
+</Tip>
